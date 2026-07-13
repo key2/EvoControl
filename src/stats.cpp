@@ -4,19 +4,26 @@
 
 #include "ttlive/events.hpp"
 
-void StatsCollector::reset() {
+void StatsCollector::reset(bool keepGifts) {
     std::lock_guard<std::mutex> lk(mutex_);
     start_ = Clock::now();
     active_ = true;
     viewers_ = peakViewers_ = 0;
-    diamonds_ = 0;
     likesTotal_ = likesLocal_ = 0;
     likesBase_ = -1;
     comments_ = joins_ = follows_ = shares_ = subscribes_ = 0;
     chatters_.clear();
-    gifters_.clear();
-    gifts_.clear();
-    gifterMap_.clear();
+
+    // Cumulative gift/diamond tallies must survive reconnects (the room can
+    // even change room_id mid-stream when the host restarts the LIVE), so a
+    // reconnect keeps them; only a fresh session (first connect / new user)
+    // clears them.
+    if (!keepGifts) {
+        diamonds_ = 0;
+        gifters_.clear();
+        gifts_.clear();
+        gifterMap_.clear();
+    }
 
     // The series vectors are read by the UI thread without the lock, and
     // reset() can run on the client thread (Connect event) — defer clearing
@@ -31,7 +38,10 @@ double StatsCollector::elapsed() const {
 void StatsCollector::record(const ttlive::Event& e) {
     using ttlive::EventType;
     if (e.type == EventType::Connect) {
-        reset();
+        // First connect starts the session; subsequent connects are
+        // reconnects that must not discard the diamonds counted so far.
+        reset(/*keepGifts=*/started_);
+        started_ = true;
         return;
     }
 

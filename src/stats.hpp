@@ -57,13 +57,18 @@ struct StatsTotals {
 
 class StatsCollector {
 public:
-    /// Any thread. Connect events reset the session.
+    /// Any thread. The first Connect starts a session; later Connects are
+    /// treated as reconnects and preserve cumulative gift/diamond totals.
     void record(const ttlive::Event& e);
 
     /// UI thread. Appends one sample per second (no-op in between).
     void sample();
 
-    void reset();
+    /// Reset session state. When keepGifts is true (a reconnect), the
+    /// cumulative diamond/gift/gifter tallies are preserved; only the
+    /// per-session counters (viewers, likes, comments, ... and the plotted
+    /// series) are cleared.
+    void reset(bool keepGifts = false);
 
     // --- UI-thread accessors -------------------------------------------
     StatsTotals totals() const;
@@ -88,6 +93,8 @@ private:
     mutable std::mutex mutex_;  // guards everything below
     Clock::time_point start_ = Clock::now();
     bool active_ = false;
+    bool started_ = false;      ///< a session has begun (distinguishes the
+                                ///< first Connect from reconnects)
     int64_t viewers_ = 0;
     int64_t peakViewers_ = 0;
     int64_t diamonds_ = 0;

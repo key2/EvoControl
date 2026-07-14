@@ -62,6 +62,7 @@
 #endif
 
 #ifdef DEARTT_STT
+#include "model_download.hpp"
 #include "stt.hpp"
 #endif
 
@@ -644,32 +645,50 @@ int main(int argc, char** argv) {
 
 #ifdef DEARTT_STT
     SttEngine stt;
+    ModelDownloader sttDownload;
     bool sttEnabled = false;
     bool sttAvailable = false;
+    std::string sttModelPath;
     {
         // Resolve the Voxtral GGUF: $DEARTT_VOXTRAL_MODEL, else the first
         // .gguf under models/voxtral/.
-        std::string modelPath;
-        if (const char* m = std::getenv("DEARTT_VOXTRAL_MODEL")) modelPath = m;
-        if (modelPath.empty()) {
+        if (const char* m = std::getenv("DEARTT_VOXTRAL_MODEL"))
+            sttModelPath = m;
+        if (sttModelPath.empty()) {
             std::string dir = findResource("models/voxtral");
             std::error_code ec;
             if (!dir.empty())
                 for (const auto& e : std::filesystem::directory_iterator(dir, ec))
                     if (e.path().extension() == ".gguf") {
-                        modelPath = e.path().string();
+                        sttModelPath = e.path().string();
                         break;
                     }
         }
-        if (!modelPath.empty()) {
+        if (!sttModelPath.empty()) {
             sttAvailable = true;
-            stt.start(modelPath);
-            // Feed the decoded audio to STT (resampled to 16 kHz mono inside).
-            player.setAudioTap([&stt](const float* pcm, int frames, int ch,
-                                      int rate) {
-                stt.pushAudio(pcm, frames, ch, rate);
-            });
+            stt.start(sttModelPath);
+        } else if (!std::getenv("DEARTT_NO_MODEL_DOWNLOAD")) {
+            // First run: the model is not shipped in the distributable
+            // (~2.7 GB). Fetch it next to the executable in the background;
+            // STT lights up when the download finishes.
+            const char* u = std::getenv("DEARTT_VOXTRAL_URL");
+            std::string url =
+                u ? u
+                  : "https://huggingface.co/andrijdavid/"
+                    "Voxtral-Mini-4B-Realtime-2602-GGUF/resolve/main/"
+                    "Q4_K_M.gguf";
+            sttModelPath = (std::filesystem::path(resourceRootDir()) /
+                            "models" / "voxtral" / "Q4_K_M.gguf")
+                               .string();
+            sttDownload.start(url, sttModelPath);
         }
+        // Feed the decoded audio to STT (resampled to 16 kHz mono inside).
+        // Always tapped: pushAudio is a no-op until the engine is ready, and
+        // the model may only become available after the download.
+        player.setAudioTap([&stt](const float* pcm, int frames, int ch,
+                                  int rate) {
+            stt.pushAudio(pcm, frames, ch, rate);
+        });
     }
 #endif
 
@@ -842,6 +861,14 @@ int main(int argc, char** argv) {
         stats.sample();      // 1 Hz time series point (throttled internally)
         giftIcons.upload();  // decoded icons -> GL textures
         avatars.upload();
+
+#ifdef DEARTT_STT
+        // First-run model download finished -> bring STT up.
+        if (!sttAvailable && sttDownload.finished()) {
+            sttAvailable = true;
+            stt.start(sttModelPath);
+        }
+#endif
 
 #ifdef DEARTT_FACE_RECOGNITION
         // Apply finished profile-picture downloads.
@@ -1036,13 +1063,24 @@ int main(int argc, char** argv) {
         if (!sttAvailable) ImGui::BeginDisabled();
         if (ImGui::Checkbox("STT", &sttEnabled)) stt.setEnabled(sttEnabled);
         if (!sttAvailable) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                sttAvailable
-                    ? "Speech-to-text (Voxtral): transcribe the stream audio\n"
-                      "into the panel next to the video."
-                    : "No Voxtral model found (models/voxtral/*.gguf or\n"
-                      "$DEARTT_VOXTRAL_MODEL).");
+        if (ImGui::IsItemHovered()) {
+            if (sttAvailable)
+                ImGui::SetTooltip(
+                    "Speech-to-text (Voxtral): transcribe the stream audio\n"
+                    "into the panel next to the video.");
+            else if (sttDownload.active())
+                ImGui::SetTooltip(
+                    "Downloading the Voxtral model — STT unlocks when the\n"
+                    "download finishes.");
+            else if (!sttDownload.error().empty())
+                ImGui::SetTooltip("Model download failed: %s\n"
+                                  "Restart the app to retry (it resumes).",
+                                  sttDownload.error().c_str());
+            else
+                ImGui::SetTooltip(
+                    "No Voxtral model found (models/voxtral/*.gguf or\n"
+                    "$DEARTT_VOXTRAL_MODEL).");
+        }
 #endif
 #ifdef DEARTT_FACE_RECOGNITION
         if (faceTracker.running()) {
@@ -1512,6 +1550,47 @@ int main(int argc, char** argv) {
                                           AvatarFetcher::Source::File, f);
             }
             g_droppedFiles.clear();
+        }
+#endif
+
+#ifdef DEARTT_STT
+        // First-run STT model download: floating progress overlay
+        // (bottom-center, on top of everything).
+        if (sttDownload.active()) {
+            const ImGuiViewport* v = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(
+                ImVec2(v->WorkPos.x + v->WorkSize.x * 0.5f,
+                       v->WorkPos.y + v->WorkSize.y - 16.0f),
+                ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowBgAlpha(0.90f);
+            ImGui::Begin("##sttdownload", nullptr,
+                         ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoFocusOnAppearing |
+                             ImGuiWindowFlags_NoNav);
+            ImGui::TextUnformatted("Downloading STT models");
+            uint64_t got = sttDownload.downloaded();
+            uint64_t tot = sttDownload.total();
+            char overlay[64];
+            if (tot > 0) {
+                std::snprintf(overlay, sizeof(overlay), "%.2f / %.2f GB",
+                              got / 1e9, tot / 1e9);
+                ImGui::ProgressBar((float)((double)got / (double)tot),
+                                   ImVec2(340, 0), overlay);
+            } else {
+                std::snprintf(overlay, sizeof(overlay), "%.2f GB", got / 1e9);
+                // Total unknown yet: indeterminate animation.
+                ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(),
+                                   ImVec2(340, 0), overlay);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("cancel")) sttDownload.cancel();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Stop the download. The partial file is kept and the\n"
+                    "download resumes on the next launch.");
+            ImGui::End();
         }
 #endif
 

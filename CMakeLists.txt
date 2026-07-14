@@ -203,7 +203,9 @@ endif()
 # -DGGML_VULKAN=ON at configure time to run on the GPU.
 # ---------------------------------------------------------------------------
 option(DEARTT_STT "Build speech-to-text via voxtral.cpp" ON)
-if(WIN32)
+if(WIN32 AND CMAKE_CROSSCOMPILING)
+  # The MinGW cross-build has no ggml toolchain set up; native Windows
+  # (MSYS2/UCRT64) builds can compile ggml + voxtral fine.
   set(DEARTT_STT OFF)
 endif()
 if(DEARTT_STT)
@@ -276,8 +278,11 @@ endif()
 
 # Speech-to-text (conditional on voxtral being built).
 if(DEARTT_STT)
-  target_sources(deartt PRIVATE src/stt.cpp)
-  target_link_libraries(deartt PRIVATE voxtral_lib)
+  target_sources(deartt PRIVATE src/stt.cpp src/model_download.cpp)
+  # model_download.cpp streams the Voxtral GGUF with libcurl directly (the
+  # ttlive HttpClient buffers bodies in memory — unusable for ~2.7 GB).
+  target_link_libraries(deartt PRIVATE voxtral_lib
+    curl_impersonate::curl_impersonate)
   target_compile_definitions(deartt PRIVATE DEARTT_STT)
 endif()
 

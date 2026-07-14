@@ -50,6 +50,14 @@ std::string findWebDir() {
     return {};
 }
 
+std::string resourceRootDir() {
+    namespace fs = std::filesystem;
+    fs::path p = exeDir();
+    if (!p.empty()) return p.string();
+    std::error_code ec;
+    return fs::current_path(ec).string();
+}
+
 std::string findResource(const std::string& relPath) {
     namespace fs = std::filesystem;
     std::error_code ec;

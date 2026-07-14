@@ -25,6 +25,10 @@ std::string findWebDir();
 /// executable, in the CWD, or in the source tree. Empty if not found.
 std::string findResource(const std::string& relPath);
 
+/// Writable root for resources created at runtime (e.g. a downloaded model):
+/// the executable's directory, or the CWD if that can't be determined.
+std::string resourceRootDir();
+
 class EventServer {
 public:
     EventServer() = default;

@@ -38,6 +38,14 @@ cp web/* "$DIST/web/"
 mkdir -p "$DIST/fonts"
 cp fonts/GoNotoKurrent-Regular.ttf fonts/Twemoji.Mozilla.ttf "$DIST/fonts/"
 
+# Face detection/recognition ONNX models (small, committed in-repo). The
+# Voxtral STT model (~2.7 GB) is intentionally NOT shipped: the app downloads
+# it at first run into models/voxtral/ (resumable, with a progress bar).
+if ls models/*.onnx >/dev/null 2>&1; then
+  mkdir -p "$DIST/models"
+  cp models/*.onnx "$DIST/models/"
+fi
+
 # Strip the dist copy (the build tree keeps its symbols for debugging).
 # -x removes local symbols only; keeps the dynamic symbols the dylibs need.
 echo "== stripping"

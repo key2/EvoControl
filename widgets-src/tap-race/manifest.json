@@ -1,0 +1,15 @@
+{
+  "type": "tap-race",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "name": "Tap Race",
+  "description": "Zero-config 2-performer race: gifts push the active side to the finish.",
+  "icon": "icon.png",
+  "defaultSize": { "w": 1000, "h": 300 },
+  "config": [
+    { "key": "finish", "type": "int", "default": 1000, "label": "Finish (diamonds)" },
+    { "key": "slots", "type": "performer-slots", "count": 2, "labels": ["A", "B"] }
+  ],
+  "subscribes": ["gift"],
+  "capabilities": []
+}

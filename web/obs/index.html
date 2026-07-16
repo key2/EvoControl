@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EvoControl — OBS overlay</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  /* Fixed logical 1080x1920 (9:16) canvas (§4). Scaled to fit the browser
+     source while keeping aspect; OBS composites it over the camera. */
+  #stage {
+    position: absolute; top: 0; left: 0;
+    width: 1080px; height: 1920px;
+    transform-origin: top left;
+    background: transparent;
+  }
+  #stage > * { position: absolute; }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <script type="module" src="/obs/host.js"></script>
+</body>
+</html>

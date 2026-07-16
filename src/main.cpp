@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -56,8 +58,15 @@
 #include "stats.hpp"
 #include "video_player.hpp"
 
+// EvoControl subsystems (§10-§14).
+#include "avatar_fetch.hpp"  // AvatarFetcher + decodeImageFileRGBA (always)
+#include "file_dialog.hpp"
+#include "game_engine.hpp"
+#include "rest_api.hpp"
+#include "store.hpp"
+#include "widget_registry.hpp"
+
 #ifdef DEARTT_FACE_RECOGNITION
-#include "avatar_fetch.hpp"
 #include "face_tracker.hpp"
 #endif
 
@@ -502,6 +511,51 @@ void drawGiftsPanel(StatsCollector& stats, IconCache& icons,
     ImGui::EndChild();
 }
 
+// The four activity waveforms (viewers, diamonds/min, likes/min, comments/min)
+// laid out in a 2x2 grid. Each cell is half the available width; the height is
+// split so both rows fit within `totalHeight`.
+void drawWaveforms2x2(StatsCollector& stats, float totalHeight) {
+    const auto& x = stats.tMin();
+    const int n = (int)x.size();
+    const ImPlotFlags plotFlags = ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect |
+                                  ImPlotFlags_NoLegend;
+    const ImPlotAxisFlags axFlags = ImPlotAxisFlags_AutoFit;
+    const ImGuiStyle& st = ImGui::GetStyle();
+    float cellH = (totalHeight - st.ItemSpacing.y) * 0.5f;
+    float cellW = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+    ImVec2 cell(cellW, cellH);
+
+    auto plot = [&](const char* title, const std::vector<double>& y,
+                    ImVec4 color, bool shade) {
+        if (ImPlot::BeginPlot(title, cell, plotFlags)) {
+            ImPlot::SetupAxes("min", nullptr, axFlags,
+                              axFlags | ImPlotAxisFlags_LockMin);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 10, ImPlotCond_Once);
+            ImPlot::SetupAxisLimitsConstraints(ImAxis_Y1, 0, INFINITY);
+            if (n > 0) {
+                if (shade)
+                    ImPlot::PlotShaded(
+                        title, x.data(), y.data(), n, 0.0,
+                        ImPlotSpec(ImPlotProp_FillColor, color,
+                                   ImPlotProp_FillAlpha, 0.3f));
+                ImPlot::PlotLine(title, x.data(), y.data(), n,
+                                 ImPlotSpec(ImPlotProp_LineColor, color));
+            }
+            ImPlot::EndPlot();
+        }
+    };
+
+    plot("Viewers", stats.viewersSeries(), ImVec4(0.5f, 0.7f, 1.0f, 1.0f), true);
+    ImGui::SameLine();
+    plot("Diamonds/min", stats.diamondsPerMin(), ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+         true);
+    plot("Likes/min", stats.likesPerMin(), ImVec4(1.0f, 0.45f, 0.60f, 1.0f),
+         true);
+    ImGui::SameLine();
+    plot("Comments/min", stats.commentsPerMin(), ImVec4(0.6f, 0.9f, 0.7f, 1.0f),
+         true);
+}
+
 const char* stateText(LiveSession::State s) {
     switch (s) {
         case LiveSession::State::Idle:         return "idle";
@@ -513,14 +567,26 @@ const char* stateText(LiveSession::State s) {
     return "?";
 }
 
-#ifdef DEARTT_FACE_RECOGNITION
 // Files dropped onto the window (GLFW drop callback, main thread during
-// glfwPollEvents); consumed by the avatar picture picker when open.
+// glfwPollEvents); consumed by the avatar picture picker and the widget
+// installer (.evw drag-drop, §8.1).
 std::vector<std::string> g_droppedFiles;
-void dropCb(GLFWwindow*, int count, const char** paths) {
+// Cursor position (in framebuffer/pixel coords, matching ImGui screen space) at
+// the moment of the drop. The OS drag doesn't emit ImGui mouse-move events, so
+// ImGui::GetMousePos() is stale during a cross-app drag — we capture the real
+// drop location here instead.
+float g_dropX = -1.0f, g_dropY = -1.0f;
+void dropCb(GLFWwindow* win, int count, const char** paths) {
+    // Cursor pos in GLFW window coords, which is the same space ImGui uses for
+    // mouse/screen coordinates with the GLFW backend.
+    double cx = 0, cy = 0;
+    glfwGetCursorPos(win, &cx, &cy);
+    g_dropX = (float)cx;
+    g_dropY = (float)cy;
     for (int i = 0; i < count; i++) g_droppedFiles.emplace_back(paths[i]);
 }
 
+#ifdef DEARTT_FACE_RECOGNITION
 // Small GL-texture cache for display-only profile pictures, keyed by person.
 struct AvatarTextures {
     struct Entry { std::string path; unsigned tex = 0; };
@@ -612,13 +678,14 @@ int main(int argc, char** argv) {
 #endif
 
     GLFWwindow* window =
-        glfwCreateWindow(1280, 760, "DearTT - TikTok LIVE viewer", nullptr, nullptr);
+        glfwCreateWindow(1280, 760,
+                         "EvoControl - TikTok LIVE show control", nullptr,
+                         nullptr);
     if (!window) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);  // vsync
-#ifdef DEARTT_FACE_RECOGNITION
-    glfwSetDropCallback(window, dropCb);  // profile-picture drag & drop
-#endif
+    // Drag & drop: profile pictures (face recog) + widget .evw bundles (§8.1).
+    glfwSetDropCallback(window, dropCb);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -635,11 +702,191 @@ int main(int argc, char** argv) {
     // so it outlives the client thread that broadcasts into it.
     EventServer eventServer;
     int wsPort = 8080;
-    if (const char* p = std::getenv("DEARTT_PORT")) {
+    if (const char* p = std::getenv("EVOCONTROL_PORT")) {
         int v = std::atoi(p);
         if (v > 0 && v < 65536) wsPort = v;
+    } else if (const char* p2 = std::getenv("DEARTT_PORT")) {
+        int v = std::atoi(p2);
+        if (v > 0 && v < 65536) wsPort = v;
     }
+
+    // --- EvoControl core: SQLite store (WAL) + widget registry + game engine +
+    // REST API, all wired into the server (§5/§10/§11). The store is the
+    // salary source of truth; totals are rebuilt from the ledger on open.
+    evo::Store store;
+    {
+        std::string dbPath =
+            (std::filesystem::path(resourceRootDir()) / "evocontrol.db")
+                .string();
+        if (!store.open(dbPath))
+            std::fprintf(stderr, "[evo] db open failed: %s\n",
+                         store.error().c_str());
+    }
+    std::string widgetsDir =
+        (std::filesystem::path(resourceRootDir()) / "widgets").string();
+    evo::WidgetRegistry widgetRegistry(store, widgetsDir);
+    // Auto-install bundled reference widgets (§21 phase 6) so the palette is
+    // populated on first run. Any .evw next to the exe / source under
+    // widgets-bundled/ is (re)installed; already-installed versions are just
+    // refreshed. Operators install more by dragging .evw onto the app.
+    {
+        std::string bundled = findResource("widgets-bundled");
+        std::error_code ec;
+        if (!bundled.empty() && std::filesystem::is_directory(bundled, ec)) {
+            for (const auto& e :
+                 std::filesystem::directory_iterator(bundled, ec)) {
+                if (e.path().extension() == ".evw") {
+                    std::string err;
+                    widgetRegistry.installFromFile(e.path().string(), err);
+                }
+            }
+        }
+    }
+    evo::GameEngine gameEngine(store, widgetRegistry);
+    evo::RestApi restApi(store, widgetRegistry, gameEngine);
+
+    // The engine broadcasts confirmed state / shared plane / navigate to views.
+    gameEngine.setBroadcaster([&eventServer](const std::string& scope,
+                                             int64_t inst,
+                                             const std::string& topic,
+                                             const std::string& data) {
+        eventServer.broadcastEnvelope(scope, inst, topic, data);
+    });
+    gameEngine.start();
+
+    eventServer.setApi(&restApi);
+    eventServer.setEngine(&gameEngine);
+    eventServer.setRegistry(&widgetRegistry);
+    if (auto pw = store.getSetting("control_password"))
+        if (!pw->empty()) eventServer.setControlPassword(*pw);
+
     eventServer.start(wsPort, findWebDir());
+
+    // Native app runtime state mirrored into the store.runtime singleton.
+    int64_t evoAccountId = 0;   // active account (0 = none)
+    int64_t evoSelectedScene = 0;  // scene selected for load/edit
+    char newAccName[128] = "";     // "New account" modal fields (top bar)
+    char newAccStream[128] = "";
+
+    // --- Manage account window (Step 2) state --------------------------------
+    // A working copy is loaded when the window opens; edits are only committed
+    // to the SQLite store on Save (Cancel discards).
+    bool showManageAccount = false;
+    char manageStream[128] = "";        // editable @stream
+    char manageNewPerformer[128] = "";  // "add performer" field
+    // A performer row in the working copy. id==0 => newly added (not yet in DB).
+    struct ManagePerformer {
+        int64_t id = 0;             // DB id (0 for new rows)
+        std::string name;           // original name (for change detection)
+        std::string avatarPath;     // current saved avatar (for the thumbnail)
+        bool deleted = false;       // marked for deletion on Save
+        char nameBuf[128] = "";     // editable name
+        char usernameBuf[128] = ""; // editable @username (TikTok fetch source)
+        bool hasFace = false;       // has a captured face landmark
+    };
+    std::vector<ManagePerformer> managePerformers;
+    // Background fetcher for TikTok @username profile pictures (Manage window).
+    AvatarFetcher manageFetcher;
+    // Small GL-texture cache for staged performer avatars (path -> tex).
+    std::map<std::string, unsigned> manageAvatarTex;
+    // Performer-avatar GL textures keyed by performer id (for the gift table),
+    // loaded on demand from the store's avatar_path.
+    std::map<int64_t, unsigned> performerAvatarTex;
+    // Width of the resizable gift-table column (0 = initialize to video width).
+    float giftTableW = 0.0f;
+    // gift id -> icon URL (from the room's gift list), so we can fetch a gift's
+    // icon on demand even for gifts that weren't pre-requested at connect time.
+    std::map<int64_t, std::string> giftIconUrls;
+
+    // Per-account avatars directory (used as the AvatarFetcher "profileDir").
+    auto accountAvatarsDir = [&](int64_t accId) {
+        return (std::filesystem::path(resourceRootDir()) / "avatars" /
+                ("account_" + std::to_string(accId)))
+            .string();
+    };
+
+    // Load the working copy from the store for the given account.
+    auto openManageAccount = [&](int64_t accId) {
+        auto acc = store.account(accId);
+        if (!acc) return;
+        std::snprintf(manageStream, sizeof(manageStream), "%s",
+                      acc->stream.c_str());
+        managePerformers.clear();
+        for (const auto& p : store.performers(accId)) {
+            ManagePerformer mp;
+            mp.id = p.id;
+            mp.name = p.name;
+            mp.avatarPath = p.avatarPath;
+            mp.hasFace = p.hasFace();
+            std::snprintf(mp.nameBuf, sizeof(mp.nameBuf), "%s", p.name.c_str());
+            std::snprintf(mp.usernameBuf, sizeof(mp.usernameBuf), "%s",
+                          p.tiktokUser.c_str());
+            managePerformers.push_back(mp);
+        }
+        manageNewPerformer[0] = '\0';
+        showManageAccount = true;
+    };
+
+    // Ensure a working-copy performer exists in the DB (so its avatar can be
+    // keyed by id) and return its id. Used when a live picture action happens
+    // on a not-yet-saved row.
+    auto ensurePerformerId = [&](ManagePerformer& mp) -> int64_t {
+        if (mp.id) return mp.id;
+        std::string name = mp.nameBuf;
+        if (name.empty()) name = "performer";
+        auto np = store.createPerformer(evoAccountId, name);
+        if (np) {
+            mp.id = np->id;
+            mp.name = np->name;
+        }
+        return mp.id;
+    };
+
+    // Apply a picture immediately (the LAST action wins): fetch from a picked
+    // file or the @username right now and attach to the performer. Async; the
+    // frame-loop poll writes avatar_path + refreshes the thumbnail.
+    auto applyPerformerPicture = [&](ManagePerformer& mp,
+                                     AvatarFetcher::Source src,
+                                     const std::string& value) {
+        int64_t id = ensurePerformerId(mp);
+        if (!id) return;
+        manageFetcher.request(accountAvatarsDir(evoAccountId),
+                              std::to_string(id), src, value);
+    };
+
+    // Commit name/username/stream/deletions to the store. Pictures are applied
+    // live (above), not here.
+    auto saveManageAccount = [&](int64_t accId) {
+        auto acc = store.account(accId);
+        if (acc) {
+            std::string s = manageStream;
+            if (!s.empty() && s[0] == '@') s.erase(0, 1);
+            acc->stream = s;
+            store.updateAccount(*acc);
+        }
+        for (auto& mp : managePerformers) {
+            std::string name = mp.nameBuf;
+            std::string user = mp.usernameBuf;
+            if (!user.empty() && user[0] == '@') user.erase(0, 1);
+            if (mp.deleted) {
+                if (mp.id) store.deletePerformer(mp.id);
+                continue;
+            }
+            int64_t id = mp.id;
+            if (id == 0) {
+                if (name.empty()) continue;
+                auto np = store.createPerformer(accId, name);
+                if (!np) continue;
+                id = np->id;
+                mp.id = id;
+            } else if (name != mp.name) {
+                store.renamePerformer(id, name);
+            }
+            store.setPerformerTiktokUser(id, user);
+        }
+        // Refresh the engine's in-memory roster (shared plane).
+        gameEngine.postLoadAccount(accId);
+    };
 
     LiveSession session;
     VideoPlayer player;
@@ -654,6 +901,28 @@ int main(int argc, char** argv) {
         std::string mdir = findResource("models");
         if (!mdir.empty()) faceTracker.start(mdir);
     }
+    int64_t facesAccountId = 0;  // account whose roster the tracker holds
+    // Point the FaceTracker at an account-specific gallery dir and seed its
+    // roster with the account's performer names (§12/§15: landmarks are matched
+    // by performer name; the engine maps recognized names back to performer ids).
+    auto selectAccountFaces = [&](int64_t accId) {
+        if (accId == 0 || accId == facesAccountId) return;
+        facesAccountId = accId;
+        std::error_code ec;
+        std::filesystem::path dir =
+            std::filesystem::path(resourceRootDir()) / "faces" /
+            ("account_" + std::to_string(accId));
+        std::filesystem::create_directories(dir, ec);
+        faceTracker.selectProfile(dir.string());
+        for (const auto& p : store.performers(accId)) {
+            faceTracker.addPerson(p.name);
+            // Seed the tracker's gallery from the SQLite landmark so matching
+            // works immediately after account load (§12/§15).
+            if (p.hasFace())
+                faceTracker.assignEmbedding(p.name, p.faceEmbedding,
+                                            p.faceQuality);
+        }
+    };
 #endif
 
 #ifdef DEARTT_STT
@@ -706,13 +975,24 @@ int main(int argc, char** argv) {
 #endif
 
     session.setEventSink(
-        [&eventServer, &stats, &avatars](const ttlive::Event& e) {
+        [&eventServer, &stats, &avatars, &gameEngine](const ttlive::Event& e) {
             stats.record(e);
             // Fetch the avatar of anyone we might display (chat, top
             // gifters); IconCache dedupes and caps by itself.
             avatars.request(e.user.id, e.user.avatar_url);
+            // Feed the game engine: it dedups streaks and credits the ledger.
+            gameEngine.postEvent(e);
             eventServer.broadcast(eventToJson(e));
         });
+
+    // REST-driven runtime hooks: connecting the ttlive client when an account
+    // is loaded from the Control view / native console.
+    restApi.resolveUserAvatar = [&avatars](int64_t) -> std::string {
+        return {};  // avatars are GL textures here; served path TBD
+    };
+    restApi.facesJson = [&gameEngine]() -> std::string {
+        return gameEngine.facesJsonArray();
+    };
 
     // "GDI Generic" (Windows) or "llvmpipe" (Linux) here means software
     // rendering — the whole UI will be slow regardless of decoding.
@@ -760,10 +1040,12 @@ int main(int argc, char** argv) {
 
     std::vector<ChatItem> chat;
     bool chatAutoScroll = true;
-    bool chatOnly = false;   // hide joins/gifts/system, show comments only
+    bool chatOnly = true;    // §16.3 default: comments only
     bool showStats = true;
+    bool showEvoConsole = false;  // EvoControl master console window (kept for
+                                  // later steps; hidden while we rebuild the UI)
     enum { kChatRight = 0, kChatOverlay = 1, kChatOff = 2 };
-    int chatMode = kChatRight;
+    int chatMode = kChatOverlay;  // §16.3 default: overlay
     size_t chatAdded = 0;    // items appended this frame (for autoscroll)
     bool playerStarted = false;
     bool noStreamUrl = false;   // connected, but room gave us no video URLs
@@ -842,9 +1124,8 @@ int main(int argc, char** argv) {
                 // logged-in sessions (status_code 4003110).
                 noStreamUrl = true;
             }
-            // Kick off gift icon downloads (names/prices/icons per gift).
-            for (const auto& g : session.giftList())
-                giftIcons.request(g.id, g.icon_url);
+            // Publish the gift gallery to the engine's shared plane (§17).
+            gameEngine.postGiftGallery(session.giftList());
         }
         if (session.state() != LiveSession::State::Connected &&
             session.state() != LiveSession::State::Connecting) {
@@ -869,6 +1150,96 @@ int main(int argc, char** argv) {
             if (faceTracker.running())
                 faceTracker.submitFrame(frameRgba.data(), fw, fh);
 #endif
+        }
+
+#ifdef DEARTT_FACE_RECOGNITION
+        // Push normalized face positions into the engine so ctx.faces() /
+        // GET /api/faces reflect the tracker (§9/§15). Throttled to ~5 Hz.
+        {
+            static double lastFacePush = 0.0;
+            double t = ImGui::GetTime();
+            if (faceTracker.running() && videoTex.w > 0 && videoTex.h > 0 &&
+                t - lastFacePush > 0.2) {
+                lastFacePush = t;
+                std::vector<evo::EngineFace> ef;
+                for (const auto& tf : faceTracker.faces()) {
+                    if (tf.name.empty()) continue;
+                    evo::EngineFace f;
+                    f.name = tf.name;
+                    f.x = tf.box.x / (double)videoTex.w;
+                    f.y = tf.box.y / (double)videoTex.h;
+                    f.w = tf.box.w / (double)videoTex.w;
+                    f.h = tf.box.h / (double)videoTex.h;
+                    f.similarity = tf.similarity;
+                    ef.push_back(f);
+                }
+                gameEngine.postFaces(ef);
+            }
+        }
+#endif
+
+        // Manage-account picture fetches: persist finished avatars (person key
+        // is the performer id) and invalidate the thumbnail cache so it redraws.
+        for (const auto& r : manageFetcher.poll()) {
+            if (!r.ok) continue;
+            int64_t pid = 0;
+            try { pid = std::stoll(r.person); } catch (...) {}
+            if (pid) store.setPerformerAvatar(pid, r.path);
+            manageAvatarTex.erase(r.path);
+            performerAvatarTex.erase(pid);  // refresh the gift-table thumbnail
+            for (auto& mp : managePerformers)
+                if (mp.id == pid) mp.avatarPath = r.path;
+            if (evoAccountId) gameEngine.postLoadAccount(evoAccountId);
+        }
+
+        // Keep the gift id -> icon URL map fresh from the room's gift list
+        // (it may arrive/refresh after connect), and request the icon for every
+        // gift id that shows up in the live monitor — including gifts that were
+        // not in the initial list. IconCache dedupes, so this is cheap.
+        {
+            static bool dbgIcons = std::getenv("EVO_DEBUG_ICONS") != nullptr;
+            static bool dumpedList = false;
+            for (const auto& g : session.giftList())
+                if (!g.icon_url.empty()) {
+                    auto& u = giftIconUrls[g.id];
+                    if (u.empty()) {
+                        u = g.icon_url;
+                        giftIcons.request(g.id, g.icon_url);
+                    }
+                }
+            // One-time dump of the full gift list (id, name, url) so we can see
+            // whether a specific gift (e.g. "Hand Heart") is present and what
+            // its icon URL is.
+            if (dbgIcons && !dumpedList && !session.giftList().empty()) {
+                dumpedList = true;
+                std::fprintf(stderr, "[icon] gift list has %zu entries:\n",
+                             session.giftList().size());
+                for (const auto& g : session.giftList())
+                    std::fprintf(stderr, "[icon]   id=%lld name='%s' url=%s\n",
+                                 (long long)g.id, g.name.c_str(),
+                                 g.icon_url.empty() ? "(none)"
+                                                    : g.icon_url.c_str());
+            }
+            for (const auto& r : gameEngine.giftMonitor()) {
+                if (!r.giftId) continue;
+                auto it = giftIconUrls.find(r.giftId);
+                if (it != giftIconUrls.end()) {
+                    giftIcons.request(r.giftId, it->second);
+                } else if (!r.giftIconUrl.empty()) {
+                    // Not in the room's gift list (e.g. basic/universal gifts
+                    // like "Hand Heart") — use the icon URL carried by the gift
+                    // event itself. Cache it so we only request once.
+                    giftIconUrls[r.giftId] = r.giftIconUrl;
+                    giftIcons.request(r.giftId, r.giftIconUrl);
+                } else if (dbgIcons) {
+                    static std::set<int64_t> warned;
+                    if (warned.insert(r.giftId).second)
+                        std::fprintf(stderr,
+                                     "[icon] MONITOR gift id=%lld name='%s' no "
+                                     "icon URL in list OR event\n",
+                                     (long long)r.giftId, r.giftName.c_str());
+                }
+            }
         }
 
         stats.sample();      // 1 Hz time series point (throttled internally)
@@ -906,48 +1277,68 @@ int main(int argc, char** argv) {
                          ImGuiWindowFlags_NoBringToFrontOnFocus |
                          ImGuiWindowFlags_NoSavedSettings);
 
-        // Top bar: profile picker + connect controls + status.
+        // Top bar (EvoControl — Step 1): Account picker + New / Manage account /
+        // Connect. Accounts are the SQLite-backed accounts (the evolved Profile,
+        // §13); the old profile combo/manager is retained below but hidden while
+        // we rebuild the console UI incrementally.
         {
             bool busy = session.state() == LiveSession::State::Connecting ||
                         session.state() == LiveSession::State::Connected;
 
-            // Profile combo.
-            ImGui::SetNextItemWidth(180);
-            const char* preview = profileLoaded ? curProfile.name.c_str()
-                                                 : "(select profile)";
-            if (ImGui::BeginCombo("##profile", preview)) {
-                for (int i = 0; i < (int)profileList.size(); i++) {
-                    bool sel = (i == profileIdx);
-                    if (ImGui::Selectable(profileList[i].c_str(), sel) && !busy)
-                        selectProfile(i);
+            // Account combo — "Select Account".
+            std::vector<evo::Account> accountList = store.accounts();
+            evo::Account* curAccount = nullptr;
+            for (auto& a : accountList)
+                if (a.id == evoAccountId) curAccount = &a;
+            const char* accPreview =
+                curAccount ? curAccount->name.c_str() : "Select Account";
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::BeginCombo("##account", accPreview)) {
+                for (const auto& a : accountList) {
+                    bool sel = a.id == evoAccountId;
+                    if (ImGui::Selectable(a.name.c_str(), sel) && !busy) {
+                        evoAccountId = a.id;
+                        gameEngine.postLoadAccount(a.id);
+#ifdef DEARTT_FACE_RECOGNITION
+                        selectAccountFaces(a.id);
+#endif
+                    }
                     if (sel) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
             }
+
+            // New account.
             ImGui::SameLine();
             if (ImGui::Button("New")) {
-                newProfName[0] = newProfStream[0] = '\0';
-                ImGui::OpenPopup("New profile");
+                newAccName[0] = newAccStream[0] = '\0';
+                ImGui::OpenPopup("New account");
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Manage") && profileLoaded)
-                showProfileMgr = true;
 
-            // New-profile modal.
-            if (ImGui::BeginPopupModal("New profile", nullptr,
+            // Manage account (disabled until an account is selected).
+            ImGui::SameLine();
+            ImGui::BeginDisabled(evoAccountId == 0);
+            if (ImGui::Button("Manage account"))
+                openManageAccount(evoAccountId);
+            ImGui::EndDisabled();
+
+            // New-account modal.
+            if (ImGui::BeginPopupModal("New account", nullptr,
                                        ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::InputTextWithHint("name", "e.g. FridayShow",
-                                         newProfName, sizeof(newProfName));
-                ImGui::InputTextWithHint("stream", "@username", newProfStream,
-                                         sizeof(newProfStream));
-                if (ImGui::Button("Create") && newProfName[0]) {
-                    if (profiles::create(newProfName, newProfStream)) {
-                        profileList = profiles::list();
-                        for (int i = 0; i < (int)profileList.size(); i++)
-                            if (profileList[i] == std::string(newProfName)) {
-                                selectProfile(i);
-                                break;
-                            }
+                ImGui::InputTextWithHint("name", "e.g. FridayShow", newAccName,
+                                         sizeof(newAccName));
+                ImGui::InputTextWithHint("stream", "@username", newAccStream,
+                                         sizeof(newAccStream));
+                if (ImGui::Button("Create") && newAccName[0]) {
+                    std::string s = newAccStream;
+                    if (!s.empty() && s[0] == '@') s.erase(0, 1);
+                    auto a = store.createAccount(newAccName, s);
+                    if (a) {
+                        evoAccountId = a->id;
+                        gameEngine.postLoadAccount(a->id);
+#ifdef DEARTT_FACE_RECOGNITION
+                        selectAccountFaces(a->id);
+#endif
                     }
                     ImGui::CloseCurrentPopup();
                 }
@@ -956,17 +1347,18 @@ int main(int argc, char** argv) {
                 ImGui::EndPopup();
             }
 
+            // Connect (disabled until an account is selected).
             ImGui::SameLine();
             if (!busy) {
-                bool canConnect = profileLoaded && !curProfile.stream.empty();
-                if (!canConnect) ImGui::BeginDisabled();
+                bool canConnect = curAccount && !curAccount->stream.empty();
+                ImGui::BeginDisabled(!canConnect);
                 if (ImGui::Button("Connect") && canConnect) {
                     chat.clear();
                     videoTex.destroy();
                     playerStarted = false;
-                    session.start(curProfile.stream);
+                    session.start(curAccount->stream);
                 }
-                if (!canConnect) ImGui::EndDisabled();
+                ImGui::EndDisabled();
             } else {
                 if (ImGui::Button("Disconnect")) {
                     session.stop();
@@ -975,6 +1367,9 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // --- everything below is retained for later UI steps but hidden
+            // now so Step 1 shows ONLY: account combo, New, Manage, Connect. ---
+            if (/*Step-1 minimal UI*/ false) {
             ImGui::SameLine();
             LiveSession::State st = session.state();
             ImVec4 stCol = st == LiveSession::State::Connected
@@ -1041,7 +1436,369 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            }  // end Step-1-hidden status/audio/quality block
         }
+
+        // --- Step 3: connected view ----------------------------------------
+        // A left column, no wider than the video, with three stacked parts:
+        //   1) a thin control bar (mute, volume, "chat only"),
+        //   2) the 1080x1920 (9:16) video with text overlay + face detection,
+        //   3) a 2x2 grid of the four activity waveforms.
+        if (session.state() == LiveSession::State::Connected) {
+            ImGui::Separator();
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+
+            // The video is 9:16. Size the left column so the video fits the
+            // available height after the control bar + waveforms; the column is
+            // never wider than the video.
+            const float barH = ImGui::GetFrameHeightWithSpacing();
+            const float waveH = 240.0f;
+            float videoBoxH = avail.y - barH - waveH -
+                              ImGui::GetStyle().ItemSpacing.y * 2.0f;
+            if (videoBoxH < 100.0f) videoBoxH = 100.0f;
+            float videoW = videoBoxH * 9.0f / 16.0f;   // 9:16
+            if (videoW > avail.x) {                     // clamp to width
+                videoW = avail.x;
+                videoBoxH = videoW * 16.0f / 9.0f;
+            }
+            float colW = videoW;
+
+            ImGui::BeginChild("leftcol", ImVec2(colW, 0),
+                              ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar);
+
+            // (1) thin control bar: mute / volume / chat only.
+            {
+                if (playerStarted) {
+                    AudioOutput& au = player.audio();
+                    bool muted = au.muted();
+                    if (ImGui::Checkbox("mute", &muted)) au.setMuted(muted);
+                    ImGui::SameLine();
+                    float vol = au.volume();
+                    ImGui::SetNextItemWidth(140);
+                    ImGui::BeginDisabled(muted);
+                    if (ImGui::SliderFloat("##vol", &vol, 0.0f, 1.0f, "vol %.2f"))
+                        au.setVolume(vol);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                }
+                ImGui::Checkbox("chat only", &chatOnly);
+            }
+
+            // (2) the 9:16 video with overlay text + face detection.
+            ImGui::BeginChild("videobox", ImVec2(colW, videoBoxH),
+                              ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar);
+            {
+                ImVec2 area = ImGui::GetContentRegionAvail();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec2 p0 = ImGui::GetCursorScreenPos();
+                dl->AddRectFilled(p0, ImVec2(p0.x + area.x, p0.y + area.y),
+                                  IM_COL32(8, 8, 10, 255));
+                ImVec2 vidPos = p0, vidSize = area;
+
+                if (videoTex.id && videoTex.w > 0) {
+                    float dispW = videoTex.w * videoTex.sar;
+                    float scale =
+                        std::min(area.x / dispW, area.y / videoTex.h);
+                    ImVec2 sz(dispW * scale, videoTex.h * scale);
+                    ImVec2 off(p0.x + (area.x - sz.x) * 0.5f,
+                               p0.y + (area.y - sz.y) * 0.5f);
+                    dl->AddImage((ImTextureID)(intptr_t)videoTex.id, off,
+                                 ImVec2(off.x + sz.x, off.y + sz.y));
+                    vidPos = off;
+                    vidSize = sz;
+
+#ifdef DEARTT_FACE_RECOGNITION
+                    // Face detection boxes + identity labels. Click a box to
+                    // assign that face to a performer (captures the embedding).
+                    if (faceTracker.running()) {
+                        float fx = sz.x / (videoTex.w * videoTex.sar);
+                        float fy = sz.y / (float)videoTex.h;
+                        ImVec2 mouse = ImGui::GetMousePos();
+                        bool clicked =
+                            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                            ImGui::IsWindowHovered();
+                        for (const auto& tf : faceTracker.faces()) {
+                            ImVec2 bmin(off.x + tf.box.x * fx,
+                                        off.y + tf.box.y * fy);
+                            ImVec2 bmax(bmin.x + tf.box.w * fx,
+                                        bmin.y + tf.box.h * fy);
+                            int a = tf.coasting ? 110 : 220;
+                            ImU32 col = tf.name.empty()
+                                            ? IM_COL32(100, 200, 255, a)
+                                            : IM_COL32(80, 255, 120, a);
+                            dl->AddRect(bmin, bmax, col, 4.0f, 0, 2.0f);
+
+                            // Click inside the box -> snapshot this face's
+                            // embedding now, open the assign popup.
+                            bool inside = mouse.x >= bmin.x &&
+                                          mouse.x <= bmax.x &&
+                                          mouse.y >= bmin.y && mouse.y <= bmax.y;
+                            if (inside)
+                                dl->AddRect(ImVec2(bmin.x - 2, bmin.y - 2),
+                                            ImVec2(bmax.x + 2, bmax.y + 2),
+                                            IM_COL32(255, 230, 90, 255), 5.0f, 0,
+                                            2.0f);
+                            if (clicked && inside && !tf.embedding.empty()) {
+                                assignTrackId = tf.trackId;
+                                assignEmb = tf.embedding;
+                                assignArea = tf.box.w * tf.box.h;
+                                ImGui::OpenPopup("AssignFaceVid");
+                            }
+
+                            if (!tf.name.empty()) {
+                                char label[128];
+                                std::snprintf(label, sizeof(label),
+                                              "%s (%.0f%%)", tf.name.c_str(),
+                                              tf.similarity * 100.0f);
+                                ImVec2 ts = ImGui::CalcTextSize(label);
+                                ImVec2 lp(bmin.x, bmin.y - ts.y - 4);
+                                dl->AddRectFilled(
+                                    ImVec2(lp.x - 2, lp.y - 1),
+                                    ImVec2(lp.x + ts.x + 4, lp.y + ts.y + 2),
+                                    IM_COL32(0, 0, 0, 180), 3.0f);
+                                dl->AddText(lp, col, label);
+                            }
+                        }
+
+                        // Assign popup: pick a performer for the snapshotted
+                        // face. Assigning to a performer that already has a
+                        // landmark simply updates it (assign is unconditional).
+                        if (ImGui::BeginPopup("AssignFaceVid")) {
+                            ImGui::TextDisabled("Assign this face to:");
+                            ImGui::Separator();
+                            for (const auto& p : store.performers(evoAccountId)) {
+                                std::string lbl =
+                                    p.name + (p.hasFace() ? "  *" : "");
+                                if (ImGui::Selectable(lbl.c_str())) {
+                                    faceTracker.assignEmbedding(
+                                        p.name, assignEmb, assignArea);
+                                    // Persist the embedding to SQLite too.
+                                    store.setPerformerFace(p.id, assignEmb,
+                                                           assignArea);
+                                    ImGui::CloseCurrentPopup();
+                                }
+                            }
+                            if (store.performers(evoAccountId).empty())
+                                ImGui::TextDisabled(
+                                    "no performers — add some in Manage");
+                            ImGui::EndPopup();
+                        }
+                    }
+#endif
+
+                    // Chat text overlay over the bottom of the video.
+                    const float margin = 12.0f;
+                    float oh = vidSize.y * 0.4f - margin;
+                    float ow = vidSize.x - 2.0f * margin;
+                    ImVec2 op(vidPos.x + margin,
+                              vidPos.y + vidSize.y - oh - margin);
+                    ImGui::SetCursorScreenPos(op);
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                          ImVec4(0, 0, 0, 0));
+                    ImGui::BeginChild("chatoverlay3", ImVec2(ow, oh),
+                                      ImGuiChildFlags_None,
+                                      ImGuiWindowFlags_NoScrollbar);
+                    drawChatFeed(true);  // shadowed text over the video
+                    ImGui::EndChild();
+                    ImGui::PopStyleColor();
+                } else {
+                    const char* msg = "connecting / buffering...";
+                    if (noStreamUrl) msg = "no stream URL for this room";
+                    ImVec2 ts = ImGui::CalcTextSize(msg);
+                    dl->AddText(ImVec2(p0.x + (area.x - ts.x) * 0.5f,
+                                       p0.y + (area.y - ts.y) * 0.5f),
+                                IM_COL32(160, 160, 170, 255), msg);
+                }
+            }
+            ImGui::EndChild();
+
+            // (3) 2x2 waveforms, no wider than the video.
+            drawWaveforms2x2(stats, waveH);
+
+            ImGui::EndChild();  // leftcol
+
+            // --- Step 4: gift column (fixed at 4/5 of the video width) ------
+            // Top 2/3: the live inline gift feed. Bottom 1/3: two side-by-side
+            // panels, "Gifts (by count)" and "Top Gifter".
+            giftTableW = colW * 0.8f;  // 4/5 of the video width (not resizable)
+            ImGui::SameLine();
+            ImGui::BeginChild("giftcolumn", ImVec2(giftTableW, 0),
+                              ImGuiChildFlags_None);
+            {
+                // Load a performer avatar texture on demand (by performer id).
+                auto performerTex = [&](int64_t pid) -> unsigned {
+                    if (!pid) return 0;
+                    auto it = performerAvatarTex.find(pid);
+                    if (it != performerAvatarTex.end()) return it->second;
+                    unsigned tex = 0;
+                    auto p = store.performer(pid);
+                    if (p && !p->avatarPath.empty()) {
+                        std::vector<uint8_t> rgba;
+                        int w = 0, h = 0;
+                        if (decodeImageFileRGBA(p->avatarPath, rgba, w, h, 64)) {
+                            glGenTextures(1, &tex);
+                            glBindTexture(GL_TEXTURE_2D, tex);
+                            glTexParameteri(GL_TEXTURE_2D,
+                                            GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D,
+                                            GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                                         GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                        }
+                    }
+                    performerAvatarTex[pid] = tex;  // cache (even 0 = no avatar)
+                    return tex;
+                };
+
+                // Top 2/3: the live inline gift feed (scrollable).
+                ImVec2 giftAvail = ImGui::GetContentRegionAvail();
+                float feedH = giftAvail.y * (2.0f / 3.0f);
+                ImGui::BeginChild("giftfeed", ImVec2(0, feedH),
+                                  ImGuiChildFlags_None,
+                                  ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+                // One inline line per gift, e.g.:
+                //   (pic) (@user): -> Rose (icon) x5 = 5  for  (pic) Alice
+                // Match the video chat overlay exactly: same font size, same
+                // colors, same shadowed/faux-bold text (chatText, shadow=true).
+                //   line 1:  @username                 (name blue, like chat)
+                //   line 2:  Rose (gift pic) x2 = 2(red) for (pic) Alice(blue)
+                const float chatFontSz = ImGui::GetFontSize() * 1.5f;
+                const float avatarSz = 36.0f;               // like the overlay
+                const float giftIco = chatFontSz * 2.0f;    // gift icon 2x
+                const ImVec4 white(1.0f, 1.0f, 1.0f, 1.0f);
+                const ImVec4 nameBlue(0.55f, 0.75f, 1.0f, 1.0f);
+                const ImVec4 red(1.0f, 0.35f, 0.35f, 1.0f);
+
+                // Inline shadowed text piece (SameLine after).
+                auto ptxt = [&](const std::string& s, const ImVec4& col) {
+                    chatText(s.c_str(), col, chatFontSz, true);
+                    ImGui::SameLine();
+                };
+                // Inline image centered on the chat line, then SameLine.
+                auto inlineImg = [&](unsigned tex, bool circle, float sz) {
+                    ImVec2 p = ImGui::GetCursorScreenPos();
+                    float dy = (chatFontSz - sz) * 0.5f;
+                    ImVec2 tl(p.x, p.y + dy);
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    if (tex) {
+                        if (circle)
+                            dl->AddImageRounded(
+                                (ImTextureID)(intptr_t)tex, tl,
+                                ImVec2(tl.x + sz, tl.y + sz), ImVec2(0, 0),
+                                ImVec2(1, 1), IM_COL32_WHITE, sz * 0.5f);
+                        else
+                            dl->AddImage((ImTextureID)(intptr_t)tex, tl,
+                                         ImVec2(tl.x + sz, tl.y + sz));
+                    } else if (circle) {
+                        dl->AddCircleFilled(
+                            ImVec2(tl.x + sz * 0.5f, tl.y + sz * 0.5f),
+                            sz * 0.5f, IM_COL32(70, 70, 82, 255));
+                    }
+                    ImGui::Dummy(ImVec2(sz, sz > chatFontSz ? sz : chatFontSz));
+                    ImGui::SameLine();
+                };
+
+                for (const auto& r : gameEngine.giftMonitor()) {
+                    // Gifter picture on the left (overlay avatar size).
+                    avatarImage(avatars.texture(r.gifterId), avatarSz);
+                    ImGui::SameLine();
+
+                    // Two stacked lines to the right, aligned like chat.
+                    ImGui::BeginGroup();
+                    ptxt("@" + r.gifterName, nameBlue);
+                    ImGui::NewLine();
+                    ptxt(r.giftName, white);
+                    inlineImg(giftIcons.texture(r.giftId), false, giftIco);
+                    char lead[48];
+                    std::snprintf(lead, sizeof(lead), "x%lld =",
+                                  (long long)r.amount);
+                    ptxt(lead, white);
+                    ptxt(std::to_string((long long)r.diamonds), red);
+                    if (r.performerId) {
+                        ptxt("for", white);
+                        inlineImg(performerTex(r.performerId), true, chatFontSz);
+                        chatText(r.performerName.c_str(), nameBlue, chatFontSz,
+                                 true);
+                    } else {
+                        ImGui::NewLine();
+                    }
+                    ImGui::EndGroup();
+                    // Visible divider between each gift entry.
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+                }
+                ImGui::EndChild();  // giftfeed (top 2/3)
+
+                // --- Bottom 1/3: "Gifts (by count)" | "Top Gifter" ----------
+                ImGui::Spacing();
+                float halfW =
+                    (ImGui::GetContentRegionAvail().x -
+                     ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+                // Left: gift counts.
+                ImGui::BeginChild("giftcounts", ImVec2(halfW, 0),
+                                  ImGuiChildFlags_Borders);
+                {
+                    ImGui::SeparatorText("Gifts (by count)");
+                    auto gifts = stats.giftStats(/*byCount=*/true);
+                    for (const auto& g : gifts) {
+                        if (unsigned tex = giftIcons.texture(g.id))
+                            ImGui::Image((ImTextureID)(intptr_t)tex,
+                                         ImVec2(20, 20));
+                        else
+                            ImGui::Dummy(ImVec2(20, 20));
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(g.name.empty() ? "?"
+                                                              : g.name.c_str());
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 44);
+                        ImGui::Text("x%s", fmtCount(g.count).c_str());
+                    }
+                    if (gifts.empty()) ImGui::TextDisabled("no gifts yet");
+                }
+                ImGui::EndChild();
+
+                ImGui::SameLine();
+
+                // Right: top gifters.
+                ImGui::BeginChild("topgifter", ImVec2(0, 0),
+                                  ImGuiChildFlags_Borders);
+                {
+                    ImGui::SeparatorText("Top Gifter");
+                    auto gifters = stats.topGifters(100);
+                    int rank = 1;
+                    for (const auto& g : gifters) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                                           "%d.", rank++);
+                        ImGui::SameLine();
+                        avatarImage(avatars.texture(g.id), 18.0f);
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(g.name.c_str());
+                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
+                        ImGui::TextDisabled("%s", fmtCount(g.diamonds).c_str());
+                    }
+                    if (gifters.empty()) ImGui::TextDisabled("no gifts yet");
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndChild();  // giftcolumn
+
+            // Right side (control panel) — intentionally empty for now.
+            ImGui::SameLine();
+            ImGui::BeginChild("controlpanel", ImVec2(0, 0),
+                              ImGuiChildFlags_None);
+            ImGui::EndChild();
+        }
+
+        // --- Step 1: the rest of the main-window body (web-server line, chat
+        // radios, stats/STT/face controls, and the video/gifts/stats/chat
+        // columns) is retained but hidden. Flip kStep1MinimalUi to restore. ---
+        const bool kStep1MinimalUi = true;
+        if (!kStep1MinimalUi) {
         if (eventServer.running())
             ImGui::TextDisabled(
                 "web http://localhost:%d  ·  ws://localhost:%d/ws  ·  %d "
@@ -1430,8 +2187,401 @@ int main(int argc, char** argv) {
             ImGui::EndChild();
             ImGui::EndChild();
         }
+        }  // end !kStep1MinimalUi (hidden main-window body)
 
         ImGui::End();
+
+        // --- Manage account modal (Step 2) ---------------------------------
+        // A MODAL so nothing behind it (New / Connect / combo) is clickable
+        // until it's closed. Edits the account's @stream and its performer
+        // roster (add / delete / rename / profile picture); staged in the
+        // working copy and committed to SQLite only on Save (Cancel discards).
+        if (showManageAccount && !ImGui::IsPopupOpen("###manageaccount"))
+            ImGui::OpenPopup("###manageaccount");
+        if (showManageAccount) {
+            // Load a staged avatar image into a GL texture (cached by path).
+            auto avatarTexFor = [&](const std::string& path) -> unsigned {
+                if (path.empty()) return 0;
+                auto it = manageAvatarTex.find(path);
+                if (it != manageAvatarTex.end()) return it->second;
+                std::vector<uint8_t> rgba;
+                int w = 0, h = 0;
+                if (!decodeImageFileRGBA(path, rgba, w, h, 96)) {
+                    manageAvatarTex[path] = 0;
+                    return 0;
+                }
+                unsigned tex = 0;
+                glGenTextures(1, &tex);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, rgba.data());
+                manageAvatarTex[path] = tex;
+                return tex;
+            };
+
+            auto acc = store.account(evoAccountId);
+            std::string title =
+                "Manage account: " + (acc ? acc->name : std::string("?"));
+            // Fixed, non-resizable, centered modal.
+            const ImGuiViewport* mvp = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(
+                ImVec2(mvp->GetCenter().x, mvp->GetCenter().y),
+                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(460, 560), ImGuiCond_Always);
+            if (ImGui::BeginPopupModal(
+                    (title + "###manageaccount").c_str(), &showManageAccount,
+                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                        ImGuiWindowFlags_NoMove)) {
+                ImGui::Text("Account: %s", acc ? acc->name.c_str() : "?");
+
+                ImGui::TextDisabled("Stream");
+                ImGui::SetNextItemWidth(260);
+                ImGui::InputTextWithHint("##stream", "@username", manageStream,
+                                         sizeof(manageStream));
+
+                ImGui::SeparatorText("Performers");
+
+                // Add a performer to the working copy.
+                ImGui::SetNextItemWidth(220);
+                bool addP = ImGui::InputTextWithHint(
+                    "##newperf", "new performer name", manageNewPerformer,
+                    sizeof(manageNewPerformer),
+                    ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                if ((ImGui::Button("Add") || addP) && manageNewPerformer[0]) {
+                    ManagePerformer mp;
+                    mp.id = 0;
+                    mp.name = manageNewPerformer;
+                    std::snprintf(mp.nameBuf, sizeof(mp.nameBuf), "%s",
+                                  manageNewPerformer);
+                    managePerformers.push_back(mp);
+                    manageNewPerformer[0] = '\0';
+                }
+                ImGui::TextDisabled(
+                    "Press Picture to load a file, or type @username and press "
+                    "Enter to fetch. The last action sets the picture.");
+
+                // Reserve space for the Save/Cancel row so the list never
+                // pushes them out of the fixed-size window.
+                float footer = ImGui::GetFrameHeightWithSpacing() +
+                               ImGui::GetStyle().ItemSpacing.y +
+                               ImGui::GetStyle().FramePadding.y * 2.0f;
+                ImGui::BeginChild("perflist", ImVec2(0, -footer), true);
+                for (size_t i = 0; i < managePerformers.size(); i++) {
+                    ManagePerformer& mp = managePerformers[i];
+                    if (mp.deleted) continue;
+                    ImGui::PushID((int)i);
+
+                    // Thumbnail: the live saved avatar (updated the moment a
+                    // Picture is loaded or a @username is fetched).
+                    unsigned tex = avatarTexFor(mp.avatarPath);
+                    const float sz = 44.0f;
+                    ImVec2 cur = ImGui::GetCursorScreenPos();
+                    if (tex)
+                        ImGui::Image((ImTextureID)(intptr_t)tex, ImVec2(sz, sz));
+                    else {
+                        ImGui::GetWindowDrawList()->AddCircleFilled(
+                            ImVec2(cur.x + sz * 0.5f, cur.y + sz * 0.5f),
+                            sz * 0.5f, IM_COL32(70, 70, 82, 255));
+                        ImGui::Dummy(ImVec2(sz, sz));
+                    }
+                    ImGui::SameLine();
+                    ImGui::BeginGroup();
+                    // Name + @username on the first line. Pressing Enter in the
+                    // username field fetches the picture immediately.
+                    ImGui::SetNextItemWidth(150);
+                    ImGui::InputTextWithHint("##name", "name", mp.nameBuf,
+                                             sizeof(mp.nameBuf));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(150);
+                    bool userEnter = ImGui::InputTextWithHint(
+                        "##user", "@username  (Enter to fetch)", mp.usernameBuf,
+                        sizeof(mp.usernameBuf),
+                        ImGuiInputTextFlags_EnterReturnsTrue);
+                    if (userEnter && mp.usernameBuf[0]) {
+                        std::string user = mp.usernameBuf;
+                        if (!user.empty() && user[0] == '@') user.erase(0, 1);
+                        if (mp.id) store.setPerformerTiktokUser(mp.id, user);
+                        applyPerformerPicture(mp, AvatarFetcher::Source::TikTok,
+                                              user);
+                    }
+                    // Picture (file dialog) — loads & applies immediately.
+                    if (ImGui::SmallButton("Picture")) {
+                        std::string f = evo::openImageFileDialog(
+                            "Picture for " + std::string(mp.nameBuf));
+                        if (!f.empty())
+                            applyPerformerPicture(
+                                mp, AvatarFetcher::Source::File, f);
+                    }
+                    ImGui::SameLine();
+                    // Face landmark status + delete (applies immediately).
+                    if (mp.hasFace) {
+                        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1.0f),
+                                           "* face");
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Delete landmark")) {
+                            if (mp.id) store.resetPerformerFace(mp.id);
+#ifdef DEARTT_FACE_RECOGNITION
+                            faceTracker.resetPerson(mp.nameBuf);
+#endif
+                            mp.hasFace = false;
+                        }
+                        ImGui::SameLine();
+                    } else {
+                        ImGui::TextDisabled("no face");
+                        ImGui::SameLine();
+                    }
+                    if (ImGui::SmallButton("Delete")) mp.deleted = true;
+                    ImGui::EndGroup();
+                    ImGui::PopID();
+                    ImGui::Separator();
+                }
+                if (managePerformers.empty())
+                    ImGui::TextDisabled("no performers yet — add one above");
+                ImGui::EndChild();
+
+                 ImGui::Separator();
+                if (ImGui::Button("Save")) {
+                    saveManageAccount(evoAccountId);
+#ifdef DEARTT_FACE_RECOGNITION
+                    // Keep the face-tracker roster in sync with performers.
+                    for (const auto& p : store.performers(evoAccountId))
+                        faceTracker.addPerson(p.name);
+#endif
+                    showManageAccount = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) {
+                    showManageAccount = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                if (!manageFetcher.status().empty()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", manageFetcher.status().c_str());
+                }
+                ImGui::EndPopup();
+            }
+        }
+
+        // --- EvoControl master console (§1/§14/§16) -------------------------
+        // Accounts, scenes, Start/Stop/New Shift/Load, the big total-coins
+        // headline, the live gift monitor, and Detect Faces. This is the
+        // operator's authoritative control surface; nothing here is streamed.
+        if (showEvoConsole) {
+            ImGui::SetNextWindowSize(ImVec2(560, 640), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("EvoControl", &showEvoConsole)) {
+                // Big total-coins headline for the current shift (§16.1),
+                // including unattributed gifts.
+                int64_t coins = gameEngine.shiftCoins();
+                ImGui::TextDisabled("SHIFT COINS");
+                ImGui::PushFont(ImGui::GetFont());
+                float big = ImGui::GetFontSize() * 2.6f;
+                {
+                    char buf[48];
+                    std::snprintf(buf, sizeof(buf), "%lld", (long long)coins);
+                    ImVec2 p = ImGui::GetCursorScreenPos();
+                    ImGui::GetWindowDrawList()->AddText(
+                        ImGui::GetFont(), big, p,
+                        IM_COL32(255, 210, 90, 255), buf);
+                    ImGui::Dummy(ImVec2(0, big + 4));
+                }
+                ImGui::PopFont();
+                ImGui::Separator();
+
+                // Account picker (accounts are the evolved profiles, §13).
+                static char newAccName[128] = "";
+                static char newAccStream[128] = "";
+                auto accounts = store.accounts();
+                std::string accPreview = "(select account)";
+                for (const auto& a : accounts)
+                    if (a.id == evoAccountId) accPreview = a.name;
+                ImGui::SetNextItemWidth(180);
+                if (ImGui::BeginCombo("account", accPreview.c_str())) {
+                    for (const auto& a : accounts) {
+                        bool sel = a.id == evoAccountId;
+                        if (ImGui::Selectable(a.name.c_str(), sel)) {
+                            evoAccountId = a.id;
+                            evoSelectedScene = 0;
+                            gameEngine.postLoadAccount(a.id);
+#ifdef DEARTT_FACE_RECOGNITION
+                            // Load this account's roster into the tracker too.
+#endif
+                            // Connect the ttlive client to the account stream.
+                            if (!a.stream.empty()) {
+                                chat.clear();
+                                videoTex.destroy();
+                                playerStarted = false;
+                                session.start(a.stream);
+                            }
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("New account"))
+                    ImGui::OpenPopup("NewAccount");
+                if (ImGui::BeginPopup("NewAccount")) {
+                    ImGui::InputTextWithHint("name", "e.g. FridayShow",
+                                             newAccName, sizeof(newAccName));
+                    ImGui::InputTextWithHint("stream", "@username", newAccStream,
+                                             sizeof(newAccStream));
+                    if (ImGui::Button("Create") && newAccName[0]) {
+                        std::string s = newAccStream;
+                        if (!s.empty() && s[0] == '@') s.erase(0, 1);
+                        auto a = store.createAccount(newAccName, s);
+                        if (a) evoAccountId = a->id;
+                        newAccName[0] = newAccStream[0] = '\0';
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                }
+
+                if (evoAccountId) {
+                    // Shift controls.
+                    ImGui::SeparatorText("Shift");
+                    if (ImGui::Button("New Shift")) {
+                        gameEngine.postNewShift();  // resets displays, keeps
+                                                    // history (§13)
+                    }
+                    ImGui::SameLine();
+                    if (auto sh = store.currentShift(evoAccountId)) {
+                        if (ImGui::Button("Export report")) {
+                            std::string js = store.shiftReportJson(sh->id);
+                            std::string dir =
+                                (std::filesystem::path(resourceRootDir()) /
+                                 "reports")
+                                    .string();
+                            std::error_code ec;
+                            std::filesystem::create_directories(dir, ec);
+                            std::string path =
+                                dir + "/shift-" + std::to_string(sh->id) +
+                                ".json";
+                            std::ofstream(path) << js;
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("shift #%lld", (long long)sh->id);
+                    }
+
+                    // Scenes: pick, load (=new run), new scene, Start/Stop.
+                    ImGui::SeparatorText("Scene");
+                    static char newSceneName[128] = "";
+                    auto scenes = store.scenes(evoAccountId);
+                    std::string scPreview = "(select scene)";
+                    for (const auto& s : scenes)
+                        if (s.id == evoSelectedScene) scPreview = s.name;
+                    ImGui::SetNextItemWidth(180);
+                    if (ImGui::BeginCombo("scene", scPreview.c_str())) {
+                        for (const auto& s : scenes) {
+                            bool sel = s.id == evoSelectedScene;
+                            if (ImGui::Selectable(s.name.c_str(), sel))
+                                evoSelectedScene = s.id;
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("New scene"))
+                        ImGui::OpenPopup("NewScene");
+                    if (ImGui::BeginPopup("NewScene")) {
+                        ImGui::InputTextWithHint("##sc", "scene name",
+                                                 newSceneName,
+                                                 sizeof(newSceneName));
+                        if (ImGui::Button("Create") && newSceneName[0]) {
+                            auto s = store.createScene(evoAccountId,
+                                                       newSceneName);
+                            if (s) {
+                                evoSelectedScene = s->id;
+                                // Force the Control view into the editor and
+                                // OBS blank (§14): load the empty scene.
+                                gameEngine.postLoadScene(s->id, false);
+                            }
+                            newSceneName[0] = '\0';
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                    }
+
+                    ImGui::BeginDisabled(evoSelectedScene == 0);
+                    if (ImGui::Button("Load scene"))
+                        gameEngine.postLoadScene(evoSelectedScene, false);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    bool run = gameEngine.running();
+                    ImGui::BeginDisabled(gameEngine.activeSceneRunId() == 0);
+                    if (!run) {
+                        if (ImGui::Button("Start"))  // begins a round (§14)
+                            gameEngine.postStart();
+                    } else {
+                        if (ImGui::Button("Stop")) gameEngine.postStop();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+#ifdef DEARTT_FACE_RECOGNITION
+                    if (ImGui::Button("Detect Faces")) {
+                        // Face positions already stream into the engine; this
+                        // button is a hint to widgets — broadcast a shared
+                        // "faces" nudge so control.js can trigger slot mapping.
+                        eventServer.broadcastEnvelope(
+                            "control", 0, "shared",
+                            "{\"topic\":\"detect-faces\"}");
+                    }
+#endif
+                }
+
+                // Live gift monitor table (§16.2).
+                ImGui::SeparatorText("Gift monitor");
+                if (ImGui::BeginTable("giftmon", 6,
+                                      ImGuiTableFlags_RowBg |
+                                          ImGuiTableFlags_ScrollY |
+                                          ImGuiTableFlags_BordersInnerH,
+                                      ImVec2(0, 220))) {
+                    ImGui::TableSetupColumn("@user");
+                    ImGui::TableSetupColumn("gift");
+                    ImGui::TableSetupColumn("x",
+                                            ImGuiTableColumnFlags_WidthFixed,
+                                            40);
+                    ImGui::TableSetupColumn("dia",
+                                            ImGuiTableColumnFlags_WidthFixed,
+                                            60);
+                    ImGui::TableSetupColumn("-> performer");
+                    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
+                                            1);
+                    ImGui::TableHeadersRow();
+                    for (const auto& r : gameEngine.giftMonitor()) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(r.gifterName.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(r.giftName.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("x%lld", (long long)r.amount);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%lld", (long long)r.diamonds);
+                        ImGui::TableNextColumn();
+                        if (r.performerId)
+                            ImGui::TextUnformatted(r.performerName.c_str());
+                        else
+                            ImGui::TextDisabled("- (show)");
+                        ImGui::TableNextColumn();
+                    }
+                    ImGui::EndTable();
+                }
+
+                ImGui::TextDisabled(
+                    "OBS overlay:  http://localhost:%d/obs", eventServer.port());
+                ImGui::TextDisabled(
+                    "Control view: http://localhost:%d/control",
+                    eventServer.port());
+            }
+            ImGui::End();
+        }
 
         // --- profile manager: stream + roster (add / delete / reset) --------
         if (showProfileMgr && profileLoaded) {
@@ -1561,6 +2711,24 @@ int main(int argc, char** argv) {
             }
             ImGui::End();
         }
+        // Dropped files: install .evw widget bundles (§8.1); route images to
+        // the avatar picker if it's open.
+        if (!g_droppedFiles.empty()) {
+            std::vector<std::string> remaining;
+            for (const auto& f : g_droppedFiles) {
+                if (f.size() > 4 &&
+                    f.compare(f.size() - 4, 4, ".evw") == 0) {
+                    std::string err;
+                    auto m = widgetRegistry.installFromFile(f, err);
+                    if (!m)
+                        std::fprintf(stderr, "[evo] install %s failed: %s\n",
+                                     f.c_str(), err.c_str());
+                } else {
+                    remaining.push_back(f);
+                }
+            }
+            g_droppedFiles.swap(remaining);
+        }
 #ifdef DEARTT_FACE_RECOGNITION
         // Route dropped image files to the person whose picture popup is open.
         if (!g_droppedFiles.empty()) {
@@ -1572,6 +2740,8 @@ int main(int argc, char** argv) {
             g_droppedFiles.clear();
         }
 #endif
+        // Any non-image drops we didn't consume are dropped.
+        g_droppedFiles.clear();
 
 #ifdef DEARTT_STT
         // First-run STT model download: floating progress overlay
@@ -1629,6 +2799,8 @@ int main(int argc, char** argv) {
     faceTracker.stop();
     avatarTex.shutdown();
 #endif
+    gameEngine.stop();
+    store.close();
     session.stop();
     player.close();   // joins the decode thread -> no more audio-tap calls
 #ifdef DEARTT_STT

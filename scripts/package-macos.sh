@@ -26,7 +26,7 @@ cp "$BUILD/deartt" "$DIST/"
 # TikTok SDK JS, loaded at runtime by the QuickJS signer (resolved relative
 # to the binary by LiveSession::findJsDir).
 mkdir -p "$DIST/js"
-cp ttlive-cpp/js/*.js "$DIST/js/"
+cp third_party/ttlive-cpp/js/*.js "$DIST/js/"
 
 # Event-viewer website, served by the embedded web server on :8080.
 mkdir -p "$DIST/web"

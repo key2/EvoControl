@@ -1,5 +1,7 @@
 #include "icon_cache.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 extern "C" {
@@ -176,13 +178,31 @@ void IconCache::workerMain() {
         }
         Decoded d;
         d.id = job.first;
+        bool dbg = std::getenv("EVO_DEBUG_ICONS") != nullptr;
+        int status = -1;
+        size_t bodyLen = 0;
+        bool decoded = false;
         try {
             ttlive::HttpResponse resp = http.get(job.second);
+            status = resp.status;
+            bodyLen = resp.body.size();
             if (resp.status == 200 && !resp.body.empty())
-                decodeIcon(resp.body, d.rgba, d.w, d.h);
+                decoded = decodeIcon(resp.body, d.rgba, d.w, d.h);
+        } catch (const std::exception& e) {
+            if (dbg)
+                std::fprintf(stderr,
+                             "[icon] id=%lld EXCEPTION %s url=%s\n",
+                             (long long)d.id, e.what(), job.second.c_str());
         } catch (...) {
-            // Network failure: leave d.rgba empty (icon simply not shown).
+            if (dbg)
+                std::fprintf(stderr, "[icon] id=%lld UNKNOWN EXCEPTION url=%s\n",
+                             (long long)d.id, job.second.c_str());
         }
+        if (dbg)
+            std::fprintf(stderr,
+                         "[icon] id=%lld status=%d body=%zu decoded=%d url=%s\n",
+                         (long long)d.id, status, bodyLen, (int)decoded,
+                         job.second.c_str());
         if (!d.rgba.empty()) {
             std::lock_guard<std::mutex> lk(mutex_);
             ready_.push_back(std::move(d));

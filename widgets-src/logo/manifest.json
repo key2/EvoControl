@@ -1,0 +1,15 @@
+{
+  "type": "logo",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "name": "Logo / Image",
+  "description": "Static image (show logo, banner). URL or bundled asset.",
+  "icon": "icon.png",
+  "defaultSize": { "w": 400, "h": 200 },
+  "config": [
+    { "key": "url", "type": "string", "default": "", "label": "Image URL" },
+    { "key": "fit", "type": "string", "default": "contain", "label": "Fit" }
+  ],
+  "subscribes": [],
+  "capabilities": []
+}

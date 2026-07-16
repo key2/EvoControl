@@ -1,0 +1,15 @@
+{
+  "type": "ranking",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "name": "Ranking",
+  "description": "Live performer diamond ranking (per-scene by default).",
+  "icon": "icon.png",
+  "defaultSize": { "w": 420, "h": 360 },
+  "config": [
+    { "key": "scope", "type": "string", "default": "scene_run", "label": "Scope" },
+    { "key": "limit", "type": "int", "default": 8, "label": "Rows" }
+  ],
+  "subscribes": ["points"],
+  "capabilities": []
+}

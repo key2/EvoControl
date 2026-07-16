@@ -1,0 +1,16 @@
+{
+  "type": "gift-goal",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "name": "Gift Goal",
+  "description": "Progress bar toward a diamond goal. Credits one performer.",
+  "icon": "icon.png",
+  "defaultSize": { "w": 900, "h": 160 },
+  "config": [
+    { "key": "title", "type": "string", "default": "Goal", "label": "Title" },
+    { "key": "goal", "type": "int", "default": 5000, "label": "Diamond goal" },
+    { "key": "slots", "type": "performer-slots", "count": 1, "labels": ["Beneficiary"] }
+  ],
+  "subscribes": ["gift"],
+  "capabilities": []
+}

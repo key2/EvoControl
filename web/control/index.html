@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EvoControl — Control</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0e0e12; color: #ddd;
+         font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
+  /* Left: the 9:16 canvas mirror. Right: fixed chrome (toolbar + palette +
+     selected-widget panel), identical for every scene (§8.3). */
+  #canvasWrap { position: relative; overflow: auto; background: #16161c;
+                display: flex; align-items: center; justify-content: center; }
+  #canvas { position: relative; width: 405px; height: 720px; /* 1080x1920 /
+            2.666 */ background: #000; box-shadow: 0 0 0 1px #333;
+            transform-origin: center; }
+  #canvas > .inst { position: absolute; outline: 1px dashed #3a6; }
+  #canvas > .inst.sel { outline: 2px solid #6cf; }
+  #side { border-left: 1px solid #2a2a33; background: #15151b;
+          display: flex; flex-direction: column; overflow: hidden; }
+  #side .sect { padding: .6em .8em; border-bottom: 1px solid #23232c; }
+  button { background: #22222b; color: #ccc; border: 1px solid #33333f;
+           border-radius: 4px; padding: .25em .7em; cursor: pointer; }
+  button.on { background: #2b4; color: #041; border-color: #2b4; }
+  .palette { display: flex; flex-wrap: wrap; gap: .4em; }
+  .palette .p { width: 64px; text-align: center; cursor: grab; font-size: 11px; }
+  .palette .p img { width: 48px; height: 48px; object-fit: contain;
+                    background: #000; border-radius: 6px; }
+  #lost { position: fixed; inset: 0; background: #000; color: #888;
+          display: none; flex-direction: column; align-items: center;
+          justify-content: center; gap: 1em; z-index: 9999; }
+  #lost.show { display: flex; }
+  #selPanel { flex: 1; overflow: auto; }
+</style>
+</head>
+<body>
+  <div id="app">
+    <div id="canvasWrap"><div id="canvas"></div></div>
+    <div id="side">
+      <div class="sect" id="toolbar"></div>
+      <div class="sect"><b>Palette</b><div class="palette" id="palette"></div></div>
+      <div class="sect" id="selPanel"><i>Select a widget on the canvas.</i></div>
+    </div>
+  </div>
+  <div id="lost">
+    <div id="lostMsg">A new control session was opened.</div>
+    <button id="takeback">Take back control</button>
+  </div>
+  <script type="module" src="/control/host.js"></script>
+</body>
+</html>

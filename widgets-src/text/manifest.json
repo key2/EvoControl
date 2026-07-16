@@ -1,0 +1,17 @@
+{
+  "type": "text",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "name": "Text",
+  "description": "Simple text label (announcements, titles). No subscriptions.",
+  "icon": "icon.png",
+  "defaultSize": { "w": 800, "h": 120 },
+  "config": [
+    { "key": "text", "type": "string", "default": "Text", "label": "Text" },
+    { "key": "size", "type": "int", "default": 64, "label": "Font size" },
+    { "key": "color", "type": "string", "default": "#ffffff", "label": "Color" },
+    { "key": "align", "type": "string", "default": "center", "label": "Align" }
+  ],
+  "subscribes": [],
+  "capabilities": []
+}

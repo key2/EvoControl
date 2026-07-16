@@ -19,6 +19,18 @@ imgui.ini
 gallery/
 profiles/
 
+# EvoControl runtime state — NEVER commit: the SQLite DB holds the gift ledger,
+# accounts, and performer face embeddings (biometric data); avatars/ and faces/
+# cache real people's pictures; widgets/ is the installed-bundle registry;
+# reports/ are exported shift reports. All are created at runtime.
+evocontrol.db
+evocontrol.db-shm
+evocontrol.db-wal
+avatars/
+faces/
+reports/
+/widgets/
+
 # Voxtral speech-to-text GGUF weights (~2.7 GB) — too large for git; fetch
 # with third_party/voxtral/tools/download_model.sh into models/voxtral/.
 models/voxtral/

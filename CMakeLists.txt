@@ -23,7 +23,7 @@ cmake_minimum_required(VERSION 3.16)
 #   OpenSSL, protobuf, zlib — required by ttlive-cpp (vcpkg on Windows).
 # ---------------------------------------------------------------------------
 
-project(DearTT LANGUAGES C CXX)
+project(EvoControl LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,9 +33,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # ---------------------------------------------------------------------------
-# ttlive-cpp — TikTok LIVE events + stream URLs
+# ttlive-cpp — TikTok LIVE events + stream URLs (vendored under third_party/)
 # ---------------------------------------------------------------------------
-add_subdirectory(ttlive-cpp)
+add_subdirectory(third_party/ttlive-cpp)
 
 # ---------------------------------------------------------------------------
 # GLFW (vendored) — window / GL context
@@ -156,6 +156,32 @@ add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/json)
 
+# ---------------------------------------------------------------------------
+# SQLite (vendored amalgamation) — EvoControl persistence (WAL): accounts,
+# performers, scenes, shifts, scene runs, the append-only GIFT LEDGER (salary
+# source of truth, §10/§12), widget state, settings.
+# ---------------------------------------------------------------------------
+add_library(sqlite3 STATIC third_party/sqlite/sqlite3.c)
+target_include_directories(sqlite3 PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
+target_compile_definitions(sqlite3 PUBLIC
+  SQLITE_THREADSAFE=1 SQLITE_ENABLE_JSON1 SQLITE_DQS=0)
+if(UNIX)
+  target_link_libraries(sqlite3 PUBLIC dl pthread)
+endif()
+
+# ---------------------------------------------------------------------------
+# miniz (vendored) — .evw / zip widget bundle extraction on install (§8.1/§19).
+# ---------------------------------------------------------------------------
+add_library(miniz STATIC
+  third_party/miniz/miniz.c
+  third_party/miniz/miniz_tdef.c
+  third_party/miniz/miniz_tinfl.c
+  third_party/miniz/miniz_zip.c
+)
+target_include_directories(miniz PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniz)
+
 # Protobuf for event_json.cpp (reflection + json_util on Webcast payloads).
 # ttlive-cpp finds it too, but its IMPORTED target is directory-scoped.
 find_package(Protobuf CONFIG QUIET)
@@ -227,7 +253,7 @@ find_package(OpenGL REQUIRED)
 # ---------------------------------------------------------------------------
 # DearTT application
 # ---------------------------------------------------------------------------
-add_executable(deartt
+add_executable(evocontrol
   src/main.cpp
   src/video_player.cpp
   src/audio_output.cpp
@@ -237,12 +263,23 @@ add_executable(deartt
   src/stats.cpp
   src/icon_cache.cpp
   src/profile.cpp
+  # EvoControl subsystems (§10-§14).
+  src/db.cpp
+  src/store.cpp
+  src/widget_registry.cpp
+  src/widget_runtime.cpp
+  src/game_engine.cpp
+  src/rest_api.cpp
+  src/file_dialog.cpp
+  # Avatar fetch + image decode (FFmpeg + ttlive HTTP; independent of ONNX) —
+  # used by the Manage account performer pictures, so always built.
+  src/avatar_fetch.cpp
 )
-target_include_directories(deartt PRIVATE src
+target_include_directories(evocontrol PRIVATE src
   # ttlive internals: http_client.hpp for gift-icon downloads (vendored lib,
   # implementation already linked via ttlive).
-  ${CMAKE_CURRENT_SOURCE_DIR}/ttlive-cpp/src)
-target_link_libraries(deartt PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ttlive-cpp/src)
+target_link_libraries(evocontrol PRIVATE
   imgui
   implot
   glfw
@@ -251,28 +288,35 @@ target_link_libraries(deartt PRIVATE
   miniaudio
   civetweb
   nlohmann_json
+  sqlite3
+  miniz
+  # QuickJS: today it is linked PRIVATE inside ttlive; link the same static lib
+  # into the app too for the widget runtime (§5/§9/§19). No duplication.
+  quickjs
   # Full protobuf runtime (already required by ttlive): event_json.cpp uses
   # reflection + json_util to decode raw Webcast payloads generically.
   protobuf::libprotobuf
   OpenGL::GL
 )
-# Development fallback for the served website (deployed installs use web/
-# next to the exe — see findWebDir / scripts/package-win64.sh).
-target_compile_definitions(deartt PRIVATE
+# Development fallback for the served website + bundled resources (deployed
+# installs use web/ + widgets-bundled/ next to the exe — see findWebDir /
+# findResource / scripts/package-*.sh).
+target_compile_definitions(evocontrol PRIVATE
+  EVOCONTROL_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web"
+  EVOCONTROL_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   DEARTT_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web"
   DEARTT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
 # Face recognition (conditional on ONNX Runtime being found).
 if(DEARTT_FACE)
-  target_sources(deartt PRIVATE
+  target_sources(evocontrol PRIVATE
     src/face_detector.cpp
     src/face_embedder.cpp
     src/face_gallery.cpp
     src/face_tracker.cpp
-    src/avatar_fetch.cpp
   )
-  target_link_libraries(deartt PRIVATE onnxruntime)
-  target_compile_definitions(deartt PRIVATE DEARTT_FACE_RECOGNITION)
+  target_link_libraries(evocontrol PRIVATE onnxruntime)
+  target_compile_definitions(evocontrol PRIVATE DEARTT_FACE_RECOGNITION)
   # On Windows, onnxruntime.dll is loaded at runtime (LoadLibrary) so the app
   # starts even if the DLL can't initialize (missing AVX2, old Windows, etc.).
   # We still link the import lib for symbol resolution, but the actual loading
@@ -281,20 +325,20 @@ endif()
 
 # Speech-to-text (conditional on voxtral being built).
 if(DEARTT_STT)
-  target_sources(deartt PRIVATE src/stt.cpp src/model_download.cpp)
+  target_sources(evocontrol PRIVATE src/stt.cpp src/model_download.cpp)
   # model_download.cpp streams the Voxtral GGUF with libcurl directly (the
   # ttlive HttpClient buffers bodies in memory — unusable for ~2.7 GB).
-  target_link_libraries(deartt PRIVATE voxtral_lib
+  target_link_libraries(evocontrol PRIVATE voxtral_lib
     curl_impersonate::curl_impersonate)
-  target_compile_definitions(deartt PRIVATE DEARTT_STT)
+  target_compile_definitions(evocontrol PRIVATE DEARTT_STT)
 endif()
 
 if(WIN32)
-  target_compile_definitions(deartt PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_definitions(evocontrol PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   # GUI subsystem: no console window (MinGW links main() fine with -mwindows).
-  set_target_properties(deartt PROPERTIES WIN32_EXECUTABLE ON)
+  set_target_properties(evocontrol PROPERTIES WIN32_EXECUTABLE ON)
 endif()
 if(APPLE)
   # ImGui's OpenGL3 backend on macOS uses the deprecated (but working) GL.
-  target_compile_definitions(deartt PRIVATE GL_SILENCE_DEPRECATION)
+  target_compile_definitions(evocontrol PRIVATE GL_SILENCE_DEPRECATION)
 endif()

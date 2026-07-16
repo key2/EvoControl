@@ -1,0 +1,17 @@
+{
+  "type": "score-battle",
+  "version": "1.2.0",
+  "apiVersion": 1,
+  "name": "Score Battle",
+  "description": "Two-side gift battle: gift->side map, rounds, top gifters.",
+  "icon": "icon.png",
+  "defaultSize": { "w": 1080, "h": 1920 },
+  "config": [
+    { "key": "round_sec", "type": "int", "default": 180, "label": "Round timer" },
+    { "key": "target_wins", "type": "int", "default": 10, "label": "Wins to victory" },
+    { "key": "slots", "type": "performer-slots", "count": 2, "labels": ["Left", "Right"] },
+    { "key": "giftRouting", "type": "gift-slot-map" }
+  ],
+  "subscribes": ["gift"],
+  "capabilities": ["gift-gallery", "user-avatar"]
+}

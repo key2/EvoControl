@@ -62,7 +62,8 @@ std::string findJsDir() {
     std::error_code ec;
     for (fs::path base : {exeDir(), fs::current_path(ec)}) {
         if (base.empty()) continue;
-        for (const char* sub : {"js", "ttlive-cpp/js"}) {
+        for (const char* sub :
+             {"js", "third_party/ttlive-cpp/js", "ttlive-cpp/js"}) {
             fs::path p = base / sub;
             if (fs::exists(p / "webmssdk.js", ec))
                 return p.string();

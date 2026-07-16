@@ -1,0 +1,14 @@
+{
+  "type": "top-gifter",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "name": "Top Gifter",
+  "description": "Spotlights the biggest gifter (avatar + total). No credits.",
+  "icon": "icon.png",
+  "defaultSize": { "w": 520, "h": 180 },
+  "config": [
+    { "key": "label", "type": "string", "default": "TOP GIFTER", "label": "Label" }
+  ],
+  "subscribes": ["gift"],
+  "capabilities": ["user-avatar"]
+}

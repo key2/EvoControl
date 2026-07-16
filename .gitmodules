@@ -17,5 +17,5 @@
 	path = third_party/miniaudio
 	url = https://github.com/mackron/miniaudio.git
 [submodule "ttlive-cpp"]
-	path = ttlive-cpp
+	path = third_party/ttlive-cpp
 	url = https://github.com/key2/ttlive-cpp.git

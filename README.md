@@ -40,8 +40,10 @@ and an embedded web server that streams every event as JSON.
 The [Releases page](https://github.com/key2/DearTT/releases) has ready-to-run
 packages:
 
-- **Windows x64** (`dist-win64.zip`) — native MSYS2/UCRT64 build with face
-  recognition and STT (Vulkan GPU + CPU) built in. Unzip and run `deartt.exe`.
+- **Windows x64** (`dist-win64.zip`) — self-contained, with face recognition
+  and STT (Vulkan GPU + CPU fallback) built in. Unzip and run `deartt.exe`.
+  Also runs under **Wine** (GPU STT needs Wine >= 10; older Wine falls back
+  to CPU STT automatically).
 - **Linux x64** (`dist-linux64.zip`) — links distro libraries at runtime (see
   the Linux build section for the required packages).
 
@@ -144,17 +146,30 @@ sudo apt install mingw-w64 nasm zip
 
    This produces a **minimal FFmpeg 7.1** (LGPL, ~5.5 MB of DLLs instead of
    the ~140 MB full builds: only FLV/HLS/MPEG-TS/fMP4 demuxers,
-   H.264/HEVC/AAC/MP3 decoders, webp/jpeg/png/gif image decoding for
-   gift icons, and https via Windows schannel), a curl-impersonate DLL
-   import lib, and static OpenSSL + protobuf. Downloads are cached in
-   `win64-deps/dl/`.
+   H.264/HEVC/AAC/MP3 decoders, webp/jpeg/png/gif image decoding for gift
+   icons and avatars, and https via Windows schannel), a curl-impersonate DLL
+   import lib, static OpenSSL + protobuf, and the **Vulkan headers + loader
+   import lib** (prebuilt MSYS2 packages) for GPU STT. Downloads are cached
+   in `win64-deps/dl/`.
 
-2. **Build the app**:
+2. **Build the app** — full-featured (face recognition + STT with Vulkan),
+   exactly what the published release uses:
 
    ```sh
-   cmake -B build-win64 -S . -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake
+   cmake -B build-win64 -S . -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake \
+     -DCMAKE_BUILD_TYPE=Release \
+     -DFFMPEG_DIR=$PWD/win64-deps/ffmpeg \
+     -DCURL_IMPERSONATE_LOCAL_DIR=$PWD/win64-deps/curl-impersonate \
+     -DONNXRUNTIME_DIR=$PWD/win64-deps/onnxruntime \
+     -DDEARTT_STT=ON -DGGML_VULKAN=ON -DGGML_NATIVE=OFF
    cmake --build build-win64 -j
    ```
+
+   STT defaults OFF in the cross-build; `-DDEARTT_STT=ON` opts in (ggml is
+   fetched at configure time and its Vulkan shader generator is compiled with
+   the host compiler automatically; `glslc` must be on the host PATH —
+   Ubuntu: `apt install glslc`). Watch the configure log for
+   `Speech-to-text: ON` and `Face recognition: ON`.
 
 3. **Package** (strips every binary, verifies all DLL imports are shipped,
    writes `build-info.txt` with per-file sha256, zips):
@@ -168,11 +183,15 @@ run `deartt.exe`. If a "DLL not found" error ever appears, compare
 `build-info.txt` in the extracted folder with the one in the zip — it means
 an old extracted copy is being launched.
 
-> **Note**: the cross-compiled build has speech-to-text disabled (no ggml
-> toolchain in the MinGW cross setup). The published Windows release is built
-> *natively* on Windows with MSYS2/UCRT64 instead, which enables STT
-> (`-DDEARTT_STT=ON -DGGML_VULKAN=ON`) and face recognition; the CMake
-> options are the same, minus the toolchain file.
+### Running the Windows build under Wine
+
+The packaged exe runs under Wine, GPU STT included: **Wine >= 10** runs the
+ggml Vulkan backend (verified real-time transcription through winevulkan);
+on Wine <= 9 the app detects the version and stays on CPU STT (winevulkan
+there can't create the compute device). The app also pre-initializes Vulkan
+before the OpenGL context exists — required under Wine, where a late host
+Vulkan init after a GLX context is live fails inside winevulkan. Face
+recognition (ONNX Runtime) works under Wine out of the box.
 
 ## Running
 
@@ -189,6 +208,10 @@ an old extracted copy is being launched.
 | `DEARTT_VOXTRAL_MODEL` | Path to a Voxtral `.gguf` (overrides the `models/voxtral/` scan) |
 | `DEARTT_VOXTRAL_URL` | Alternate URL for the first-run model download |
 | `DEARTT_NO_MODEL_DOWNLOAD` | Set to disable the automatic first-run model download |
+| `DEARTT_STT_GPU` | STT compute: `auto`/`vulkan` force a GPU attempt (even under old Wine), `none`/`cpu` force CPU (e.g. weak iGPUs where the 2.7 GB weight upload takes minutes) |
+
+The active STT backend is shown in the video stats overlay
+(`... | stt Vulkan` / `... | stt CPU`) and logged at startup.
 
 The webview at `http://localhost:8080/` shows every event live; the
 `/ws` WebSocket delivers them as JSON (type, user, gift fields incl.

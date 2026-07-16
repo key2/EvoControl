@@ -24,6 +24,10 @@ CI_URL="https://github.com/lexiforest/curl-impersonate/releases/download/v2.0.0a
 OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz"
 # Protobuf must match the host protoc's version (protoc --version).
 PROTOBUF_URL="https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz"
+# Vulkan headers + loader import lib for the ggml Vulkan backend (STT GPU).
+# Prebuilt MSYS2 packages: plain zstd tarballs, extracted without pacman.
+VULKAN_HEADERS_URL="https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-headers-1.4.317-1-any.pkg.tar.zst"
+VULKAN_LOADER_URL="https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-loader-1.4.317-2-any.pkg.tar.zst"
 
 mkdir -p "$DL"
 fetch() { [ -f "$DL/$2" ] || curl -fL "$1" -o "$DL/$2"; }
@@ -54,7 +58,7 @@ if [ ! -d "$DEPS/ffmpeg" ]; then
       --disable-everything \
       --enable-network --enable-schannel --enable-zlib \
       --enable-protocol=file,http,https,tcp,tls,crypto \
-      --enable-demuxer=flv,live_flv,hls,mpegts,mov,aac,mp3,webp_pipe,jpeg_pipe,png_pipe,gif \
+      --enable-demuxer=flv,live_flv,hls,mpegts,mov,aac,mp3,image_webp_pipe,image_jpeg_pipe,image_png_pipe,gif \
       --enable-decoder=h264,hevc,aac,mp3,mp3float,webp,mjpeg,png,gif \
       --enable-parser=h264,hevc,aac,mpegaudio,mjpeg,png,webp \
       --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc,extract_extradata
@@ -125,6 +129,31 @@ if [ ! -d "$DEPS/protobuf" ]; then
   cmake --build "$DEPS/src-protobuf/build" -j"$JOBS" >/dev/null
   cmake --install "$DEPS/src-protobuf/build" >/dev/null
   rm -rf "$DEPS/src-protobuf"
+fi
+
+# ---------------------------------------------------------------------------
+# Vulkan headers + loader import lib (prebuilt MSYS2 packages). Enables the
+# ggml Vulkan backend in the cross-build (-DDEARTT_STT=ON -DGGML_VULKAN=ON):
+# the import lib is CRT-agnostic, glslc runs as a host tool, and ggml builds
+# its shader generator with the host compiler automatically. Only the headers
+# and libvulkan-1.dll.a are kept — vulkan-1.dll itself is a system DLL
+# installed by GPU drivers and must not be shipped.
+# ---------------------------------------------------------------------------
+if [ ! -d "$DEPS/vulkan" ]; then
+  echo "== Vulkan headers + loader import lib (prebuilt MSYS2)"
+  fetch "$VULKAN_HEADERS_URL" vulkan-headers.pkg.tar.zst
+  fetch "$VULKAN_LOADER_URL" vulkan-loader.pkg.tar.zst
+  rm -rf "$DEPS/vulkan.tmp"
+  mkdir -p "$DEPS/vulkan.tmp"
+  tar --zstd -xf "$DL/vulkan-headers.pkg.tar.zst" -C "$DEPS/vulkan.tmp"
+  tar --zstd -xf "$DL/vulkan-loader.pkg.tar.zst" -C "$DEPS/vulkan.tmp"
+  mkdir -p "$DEPS/vulkan/lib"
+  cp -r "$DEPS/vulkan.tmp/ucrt64/include" "$DEPS/vulkan/include"
+  cp "$DEPS/vulkan.tmp/ucrt64/lib/"libvulkan*.dll.a "$DEPS/vulkan/lib/"
+  # CMake's FindVulkan searches for 'vulkan-1' on Windows targets.
+  [ -f "$DEPS/vulkan/lib/libvulkan-1.dll.a" ] || \
+    cp "$DEPS/vulkan/lib/libvulkan.dll.a" "$DEPS/vulkan/lib/libvulkan-1.dll.a"
+  rm -rf "$DEPS/vulkan.tmp"
 fi
 
 echo "== done: $DEPS"

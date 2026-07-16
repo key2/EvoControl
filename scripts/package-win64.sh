@@ -30,6 +30,18 @@ cp "$DEPS/curl-impersonate/lib/libcurl-impersonate.dll" "$DIST/"
 # MinGW runtime (libgcc/libstdc++ are linked statically; see the toolchain).
 cp "$MINGW_LIB/libwinpthread-1.dll" "$DIST/"
 cp "$MINGW_LIB/zlib1.dll" "$DIST/"
+# OpenMP runtime (ggml's CPU backend, when STT is built in). Lives in the
+# cross gcc's own lib dir, not the mingw sysroot.
+# (grep -q would SIGPIPE objdump under pipefail; buffer the output instead)
+if x86_64-w64-mingw32-objdump -p "$BUILD/deartt.exe" | grep libgomp-1.dll >/dev/null; then
+  # libgomp-1.dll itself imports the shared libgcc, so ship that too (the
+  # exe links -static-libgcc, but the DLL can't).
+  for dll in libgomp-1.dll libgcc_s_seh-1.dll; do
+    f=$(x86_64-w64-mingw32-g++-posix -print-file-name=$dll 2>/dev/null)
+    [ -f "$f" ] || f=$(x86_64-w64-mingw32-g++ -print-file-name=$dll)
+    cp "$f" "$DIST/"
+  done
+fi
 
 # TikTok SDK JS, loaded at runtime by the QuickJS signer (resolved relative
 # to the exe by LiveSession::findJsDir).
@@ -97,7 +109,7 @@ for dll in $(x86_64-w64-mingw32-objdump -p "$DIST/deartt.exe" |
   case "$dll" in
     KERNEL32.dll|USER32.dll|GDI32.dll|SHELL32.dll|OPENGL32.dll|msvcrt.dll|\
     ADVAPI32.dll|WS2_32.dll|ole32.dll|IMM32.dll|SETUPAPI.dll|WINMM.dll|\
-    api-ms-*) continue ;;
+    vulkan-1.dll|api-ms-*) continue ;;
   esac
   if [ ! -f "$DIST/$dll" ]; then
     echo "  MISSING: $dll"

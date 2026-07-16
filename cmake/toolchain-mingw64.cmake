@@ -33,6 +33,8 @@ set(CMAKE_FIND_ROOT_PATH
   ${_deartt_deps}/protobuf
   ${_deartt_deps}/curl-impersonate
   ${_deartt_deps}/ffmpeg
+  ${_deartt_deps}/vulkan
+  ${_deartt_deps}/onnxruntime
 )
 
 # Host programs (protoc, python, ...), target libs/headers only from the

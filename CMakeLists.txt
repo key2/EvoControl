@@ -202,11 +202,14 @@ endif()
 # doesn't set up a ggml toolchain). Enable a GPU backend with e.g.
 # -DGGML_VULKAN=ON at configure time to run on the GPU.
 # ---------------------------------------------------------------------------
-option(DEARTT_STT "Build speech-to-text via voxtral.cpp" ON)
+# ggml + voxtral compile fine under MinGW (native MSYS2 or the Linux cross
+# toolchain), but the cross-build additionally needs the Vulkan headers +
+# import lib from scripts/build-win64-deps.sh — so STT defaults OFF there
+# and is opted in with -DDEARTT_STT=ON (typically with -DGGML_VULKAN=ON).
 if(WIN32 AND CMAKE_CROSSCOMPILING)
-  # The MinGW cross-build has no ggml toolchain set up; native Windows
-  # (MSYS2/UCRT64) builds can compile ggml + voxtral fine.
-  set(DEARTT_STT OFF)
+  option(DEARTT_STT "Build speech-to-text via voxtral.cpp" OFF)
+else()
+  option(DEARTT_STT "Build speech-to-text via voxtral.cpp" ON)
 endif()
 if(DEARTT_STT)
   set(VOXTRAL_NATIVE_OPT OFF CACHE BOOL "" FORCE)  # avoid -march=native ABI risk
